@@ -1,0 +1,232 @@
+name: TikTok Downloader
+
+on:
+  repository_dispatch:
+    types: [bale_download_tiktok]
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'TikTok URL'
+        required: true
+
+jobs:
+  download-and-send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Cache ffmpeg
+      uses: actions/cache@v4
+      with:
+        path: /usr/local/bin/ff*
+        key: ffmpeg-static-v2
+
+    - name: Cache yt-dlp
+      uses: actions/cache@v4
+      with:
+        path: /usr/local/bin/yt-dlp
+        key: ytdlp-standalone-v1
+
+    - name: Cache Deno
+      uses: actions/cache@v4
+      with:
+        path: ~/.deno
+        key: deno-linux-x64-v1
+
+    - name: Install tools
+      run: |
+        if [ ! -f /usr/local/bin/ffmpeg ]; then
+          curl -L https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz -o /tmp/ffmpeg.tar.xz
+          cd /tmp && tar xf ffmpeg.tar.xz
+          sudo cp /tmp/ffmpeg-*-amd64-static/ffmpeg /usr/local/bin/ffmpeg
+          sudo cp /tmp/ffmpeg-*-amd64-static/ffprobe /usr/local/bin/ffprobe
+          sudo chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe
+          rm -rf /tmp/ffmpeg*
+        fi
+        if [ ! -f /usr/local/bin/yt-dlp ]; then
+          sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+          sudo chmod +x /usr/local/bin/yt-dlp
+        fi
+        if [ ! -f "$HOME/.deno/bin/deno" ]; then
+          curl -fsSL https://deno.land/install.sh | sh
+        fi
+        echo "$HOME/.deno/bin" >> $GITHUB_PATH
+
+    - name: Resolve inputs
+      id: inputs
+      run: |
+        URL="${{ github.event.client_payload.url || inputs.url }}"
+        CHAT_ID="${{ github.event.client_payload.chat_id || '' }}"
+        PROGRESS_MSG_ID="${{ github.event.client_payload.progress_msg_id || '' }}"
+        GROUP_CHAT_ID="${{ github.event.client_payload.group_chat_id || '' }}"
+        echo "url=${URL}" >> $GITHUB_OUTPUT
+        echo "chat_id=${CHAT_ID}" >> $GITHUB_OUTPUT
+        echo "progress_msg_id=${PROGRESS_MSG_ID}" >> $GITHUB_OUTPUT
+        echo "group_chat_id=${GROUP_CHAT_ID}" >> $GITHUB_OUTPUT
+
+    - name: Report progress
+      run: |
+        report() {
+          if [ -n "${{ steps.inputs.outputs.chat_id }}" ] && [ -n "${{ steps.inputs.outputs.progress_msg_id }}" ]; then
+            curl -s -X POST "${{ vars.WORKER_URL }}/progress" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\":\"${{ steps.inputs.outputs.chat_id }}\",\"message_id\":\"${{ steps.inputs.outputs.progress_msg_id }}\",\"progress\":\"$1\",\"status\":\"$2\",\"file_size\":\"${3:-}\",\"quality\":\"${4:-}\"}" > /dev/null 2>&1 || true
+          fi
+        }
+        report 10 "downloading"
+
+    - name: Download TikTok
+      id: download
+      env:
+        CHAT_ID: ${{ steps.inputs.outputs.chat_id }}
+        PROGRESS_MSG_ID: ${{ steps.inputs.outputs.progress_msg_id }}
+      run: |
+        report() {
+          if [ -n "$CHAT_ID" ] && [ -n "$PROGRESS_MSG_ID" ]; then
+            curl -s -X POST "${{ vars.WORKER_URL }}/progress" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\":\"$CHAT_ID\",\"message_id\":\"$PROGRESS_MSG_ID\",\"progress\":\"$1\",\"status\":\"$2\",\"file_size\":\"${3:-}\",\"quality\":\"${4:-}\"}" > /dev/null 2>&1 || true
+          fi
+        }
+        URL="${{ steps.inputs.outputs.url }}"
+        mkdir -p /tmp/tt_download && cd /tmp/tt_download
+        report 20 "downloading"
+        yt-dlp \
+          --write-thumbnail --convert-thumbnails jpg \
+          -o "tt_%(id)s.%(ext)s" \
+          --no-overwrites --ignore-errors \
+          --js-runtimes deno \
+          "$URL" 2>&1 || true
+        report 70 "downloading"
+        THUMB=""
+        for f in *.jpg *.png; do [ -f "$f" ] && THUMB="$f" && break; done
+        VIDEO=""
+        for f in *.mp4 *.webm *.mkv; do [ -f "$f" ] && VIDEO="$f" && break; done
+        if [ -z "$VIDEO" ]; then
+          for f in *; do
+            EXT="${f##*.}"
+            if [ "$EXT" != "jpg" ] && [ "$EXT" != "png" ] && [ -f "$f" ]; then
+              VIDEO="$f"
+              break
+            fi
+          done
+        fi
+        FILE_COUNT=0
+        for f in *; do [ -f "$f" ] && FILE_COUNT=$((FILE_COUNT + 1)); done
+        TOTAL_SIZE=$(du -sh /tmp/tt_download 2>/dev/null | cut -f1 | sed 's/M$/MB/' | sed 's/G$/GB/')
+        echo "video=${VIDEO}" >> $GITHUB_OUTPUT
+        echo "thumb=${THUMB}" >> $GITHUB_OUTPUT
+        echo "file_count=${FILE_COUNT}" >> $GITHUB_OUTPUT
+        echo "total_size=${TOTAL_SIZE}" >> $GITHUB_OUTPUT
+        echo "Video: $VIDEO, Thumb: $THUMB, Count: $FILE_COUNT, Size: $TOTAL_SIZE"
+        report 90 "downloading"
+
+    - name: Send to Bale
+      env:
+        BALE_BOT_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
+        CHAT_ID: ${{ steps.inputs.outputs.chat_id }}
+        PROGRESS_MSG_ID: ${{ steps.inputs.outputs.progress_msg_id }}
+        GROUP_CHAT_ID: ${{ steps.inputs.outputs.group_chat_id }}
+        VIDEO_FILE: ${{ steps.download.outputs.video_file }}
+        THUMB_FILE: ${{ steps.download.outputs.thumb }}
+        FILE_COUNT: ${{ steps.download.outputs.file_count }}
+        TOTAL_SIZE: ${{ steps.download.outputs.total_size }}
+      run: |
+        report() {
+          if [ -n "$CHAT_ID" ] && [ -n "$PROGRESS_MSG_ID" ]; then
+            curl -s -X POST "${{ vars.WORKER_URL }}/progress" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\":\"$CHAT_ID\",\"message_id\":\"$PROGRESS_MSG_ID\",\"progress\":\"$1\",\"status\":\"$2\",\"file_size\":\"${3:-}\",\"quality\":\"${4:-}\"}" > /dev/null 2>&1 || true
+          fi
+        }
+        send_with_retry() {
+          local API_URL="$1"; shift
+          local MAX_RETRIES=5
+          for i in $(seq 1 $MAX_RETRIES); do
+            RESP=$(curl -s -X POST "$API_URL" "$@")
+            ERROR_CODE=$(echo "$RESP" | grep -o '"error_code":[0-9]*' | head -1 | cut -d: -f2)
+            if [ "$ERROR_CODE" = "429" ]; then
+              RETRY_AFTER=$(echo "$RESP" | grep -o '"retry_after":[0-9]*' | head -1 | cut -d: -f2)
+              RETRY_AFTER=${RETRY_AFTER:-60}
+              echo "Rate limited. Waiting ${RETRY_AFTER}s (attempt $i/$MAX_RETRIES)"
+              sleep $((RETRY_AFTER + 2))
+              continue
+            fi
+            echo "$RESP"
+            return 0
+          done
+          echo '{"ok":false}'
+          return 1
+        }
+
+        report 95 "uploading" || true
+        cd /tmp/tt_download
+        API_URL="https://tapi.bale.ai/bot${BALE_BOT_TOKEN}"
+        MSG_ID=""
+
+        cd /tmp/tt_download
+        ls -la || true
+        VIDEO=""
+        for f in *.mp4 *.webm *.mkv; do [ -f "$f" ] && VIDEO="$f" && break; done
+        if [ -z "$VIDEO" ]; then
+          for f in *; do
+            EXT="${f##*.}"
+            if [ "$EXT" != "jpg" ] && [ "$EXT" != "png" ] && [ -f "$f" ]; then
+              VIDEO="$f"
+              break
+            fi
+          done
+        fi
+
+        if [ -n "$VIDEO" ] && [ -f "$VIDEO" ]; then
+          FILE_BYTES=$(stat -c%s "$VIDEO" 2>/dev/null || echo 0)
+          if [ "$FILE_BYTES" -gt 52428800 ]; then
+            echo "Video exceeds 50MB ($FILE_BYTES bytes). Splitting..."
+            zip -s 45m "media_split.zip" "$VIDEO"
+            TOTAL_PARTS=0
+            for sp in media_split.zip media_split.z[0-9]*; do
+              [ -f "$sp" ] && TOTAL_PARTS=$((TOTAL_PARTS + 1))
+            done
+            echo "Split into $TOTAL_PARTS parts"
+            PART_NUM=0
+            for sp in media_split.zip media_split.z[0-9]*; do
+              [ -f "$sp" ] || continue
+              PART_NUM=$((PART_NUM + 1))
+              echo "Sending part $PART_NUM/$TOTAL_PARTS: $sp"
+              RESP=$(send_with_retry "${API_URL}/sendDocument" \
+                -F chat_id="$CHAT_ID" \
+                -F document=@"$sp" \
+                -F caption="📦 Part ${PART_NUM}/${TOTAL_PARTS} — TikTok")
+              MID=$(echo "$RESP" | grep -o '"message_id":[0-9]*' | head -1 | cut -d: -f2)
+              if [ -n "$MID" ] && [ "$MID" != "0" ]; then MSG_ID="$MID"; fi
+            done
+            FILE_SIZE_MB=$(echo "scale=1; $FILE_BYTES / 1048576" | bc)
+            send_with_retry "${API_URL}/sendMessage" \
+              -F chat_id="$CHAT_ID" \
+              -F text="✅ TikTok — ${FILE_SIZE_MB}MB in ${TOTAL_PARTS} parts" > /dev/null 2>&1 || true
+            rm -f media_split.z*
+          else
+            echo "Sending video: $VIDEO"
+            RESP=$(send_with_retry "${API_URL}/sendVideo" \
+              -F chat_id="$CHAT_ID" \
+              -F video=@"$VIDEO" \
+              -F supports_streaming=true)
+            MID=$(echo "$RESP" | grep -o '"message_id":[0-9]*' | head -1 | cut -d: -f2)
+            if [ -n "$MID" ] && [ "$MID" != "0" ]; then MSG_ID="$MID"; fi
+          fi
+        fi
+
+        echo "Final MSG_ID=$MSG_ID"
+        if [ -z "$MSG_ID" ] || [ "$MSG_ID" = "null" ]; then
+          report 0 "error" || true
+          exit 1
+        fi
+        report 100 "done" "$TOTAL_SIZE" "TikTok" || true
+        if [ -n "$GROUP_CHAT_ID" ] && [ "$GROUP_CHAT_ID" != "null" ]; then
+          curl -s -X POST "https://tapi.bale.ai/bot${BALE_BOT_TOKEN}/forwardMessage" -d chat_id="$GROUP_CHAT_ID" -d from_chat_id="$CHAT_ID" -d message_id="$PROGRESS_MSG_ID" || true
+          if [ -n "$MSG_ID" ] && [ "$MSG_ID" != "null" ]; then
+            curl -s -X POST "https://tapi.bale.ai/bot${BALE_BOT_TOKEN}/forwardMessage" -d chat_id="$GROUP_CHAT_ID" -d from_chat_id="$CHAT_ID" -d message_id="$MSG_ID" || true
+          fi
+        fi

@@ -1,0 +1,353 @@
+name: Direct YouTube Download (Large Files)
+
+on:
+  repository_dispatch:
+    types: [bale_download_large]
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'YouTube URL'
+        required: true
+      quality:
+        description: 'Quality'
+        required: false
+        default: '720'
+
+jobs:
+  download-and-send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+    - name: Checkout (for cookies.txt)
+      uses: actions/checkout@v4
+
+    # ---------- Cache all tools ----------
+    - name: Cache ffmpeg
+      uses: actions/cache@v4
+      id: ffmpeg-cache
+      with:
+        path: /usr/local/bin/ff*
+        key: ffmpeg-static-v2
+
+    - name: Cache yt-dlp
+      uses: actions/cache@v4
+      id: ytdlp-cache
+      with:
+        path: /usr/local/bin/yt-dlp
+        key: ytdlp-standalone-v1
+
+    - name: Cache Deno
+      uses: actions/cache@v4
+      id: deno-cache
+      with:
+        path: ~/.deno
+        key: deno-linux-x64-v1
+
+    # ---------- Install tools (only on cache miss) ----------
+    - name: Install tools
+      run: |
+        # FFmpeg static binary (skip apt-get entirely)
+        if [ ! -f /usr/local/bin/ffmpeg ]; then
+          curl -L https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz -o /tmp/ffmpeg.tar.xz
+          cd /tmp && tar xf ffmpeg.tar.xz
+          sudo cp /tmp/ffmpeg-*-amd64-static/ffmpeg /usr/local/bin/ffmpeg
+          sudo cp /tmp/ffmpeg-*-amd64-static/ffprobe /usr/local/bin/ffprobe
+          sudo chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe
+          rm -rf /tmp/ffmpeg*
+        fi
+        # yt-dlp standalone binary
+        if [ ! -f /usr/local/bin/yt-dlp ]; then
+          sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+          sudo chmod +x /usr/local/bin/yt-dlp
+        fi
+        # Deno
+        if [ ! -f "$HOME/.deno/bin/deno" ]; then
+          curl -fsSL https://deno.land/install.sh | sh
+        fi
+        echo "$HOME/.deno/bin" >> $GITHUB_PATH
+        sudo apt-get install -y jq > /dev/null 2>&1 || true
+        echo "ffmpeg: $(ffmpeg -version 2>&1 | head -1)"
+        echo "yt-dlp: $(yt-dlp --version)"
+
+    # ---------- Resolve inputs ----------
+    - name: Resolve inputs
+      id: inputs
+      run: |
+        URL="${{ github.event.client_payload.url || inputs.url }}"
+        QUALITY="${{ github.event.client_payload.quality || inputs.quality || '720' }}"
+        CHAT_ID="${{ github.event.client_payload.chat_id || '' }}"
+        PROGRESS_MSG_ID="${{ github.event.client_payload.progress_msg_id || '' }}"
+        THUMB_MSG_ID="${{ github.event.client_payload.thumbnail_msg_id || '' }}"
+        GROUP_CHAT_ID="${{ github.event.client_payload.group_chat_id || '' }}"
+        echo "url=${URL}" >> $GITHUB_OUTPUT
+        echo "quality=${QUALITY}" >> $GITHUB_OUTPUT
+        echo "chat_id=${CHAT_ID}" >> $GITHUB_OUTPUT
+        echo "progress_msg_id=${PROGRESS_MSG_ID}" >> $GITHUB_OUTPUT
+        echo "thumb_msg_id=${THUMB_MSG_ID}" >> $GITHUB_OUTPUT
+        echo "group_chat_id=${GROUP_CHAT_ID}" >> $GITHUB_OUTPUT
+
+    # ---------- Report progress helper ----------
+    - name: Report progress
+      id: progress
+      run: |
+        report_progress() {
+          if [ -n "$CHAT_ID" ] && [ -n "$PROGRESS_MSG_ID" ]; then
+            curl -s -X POST "${{ vars.WORKER_URL }}/progress" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\":\"$CHAT_ID\",\"message_id\":\"$PROGRESS_MSG_ID\",\"progress\":\"$1\",\"status\":\"$2\",\"file_size\":\"${3:-}\",\"quality\":\"${4:-}\"}" > /dev/null 2>&1 || true
+          fi
+        }
+        echo "CHAT_ID=${{ steps.inputs.outputs.chat_id }}" >> $GITHUB_OUTPUT
+        echo "PROGRESS_MSG_ID=${{ steps.inputs.outputs.progress_msg_id }}" >> $GITHUB_OUTPUT
+        # Test connectivity
+        report_progress 0 "downloading"
+
+    # ---------- Get video title ----------
+    - name: Get video title
+      id: title
+      run: |
+        URL="${{ steps.inputs.outputs.url }}"
+        RAW_TITLE=$(yt-dlp --get-title "$URL" --cookies cookies.txt --js-runtimes deno 2>/dev/null || echo "YouTube_Video")
+        SAFE_TITLE=$(echo "$RAW_TITLE" | sed 's/[^a-zA-Z0-9\-]/_/g' | sed 's/__*/_/g' | cut -c1-100)
+        echo "raw_title=${RAW_TITLE}" >> $GITHUB_OUTPUT
+        echo "safe_title=${SAFE_TITLE}" >> $GITHUB_OUTPUT
+
+    # ---------- Download and optimize video ----------
+    - name: Download and optimize video
+      id: download
+      env:
+        CHAT_ID: ${{ steps.inputs.outputs.chat_id }}
+        PROGRESS_MSG_ID: ${{ steps.inputs.outputs.progress_msg_id }}
+      run: |
+        report() {
+          if [ -n "$CHAT_ID" ] && [ -n "$PROGRESS_MSG_ID" ]; then
+            curl -s -X POST "${{ vars.WORKER_URL }}/progress" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\":\"$CHAT_ID\",\"message_id\":\"$PROGRESS_MSG_ID\",\"progress\":\"$1\",\"status\":\"$2\",\"file_size\":\"${3:-}\",\"quality\":\"${4:-}\"}" > /dev/null 2>&1 || true
+          fi
+        }
+
+        URL="${{ steps.inputs.outputs.url }}"
+        QUALITY="${{ steps.inputs.outputs.quality }}"
+        SAFE_TITLE="${{ steps.title.outputs.safe_title }}"
+
+        report 10 "downloading"
+
+        case "$QUALITY" in
+          "144")  F="-f bestvideo[height<=144]+bestaudio/best[height<=144]" ;;
+          "240")  F="-f bestvideo[height<=240]+bestaudio/best[height<=240]" ;;
+          "360")  F="-f bestvideo[height<=360]+bestaudio/best[height<=360]" ;;
+          "480")  F="-f bestvideo[height<=480]+bestaudio/best[height<=480]" ;;
+          "720")  F="-f bestvideo[height<=720]+bestaudio/best[height<=720]" ;;
+          "1080") F="-f bestvideo[height<=1080]+bestaudio/best[height<=1080]" ;;
+          "best") F="--merge-output-format mp4" ;;
+          "audio") F="-x --audio-format mp3" ;;
+          *)      F="-f bestvideo[height<=720]+bestaudio/best[height<=720]" ;;
+        esac
+
+        report 20 "downloading"
+
+        yt-dlp $F \
+          --merge-output-format mp4 \
+          --write-thumbnail --convert-thumbnails jpg \
+          --cookies cookies.txt \
+          --js-runtimes deno \
+          -o "${SAFE_TITLE}.%(ext)s" "$URL"
+
+        report 60 "downloading"
+
+        if [ "$QUALITY" = "audio" ]; then
+          EXT="mp3"
+          FINAL_NAME="${SAFE_TITLE}.${EXT}"
+          cp "${SAFE_TITLE}.${EXT}" "$FINAL_NAME"
+          FILE_SIZE=$(du -h "$FINAL_NAME" | cut -f1 | sed 's/M$/MB/' | sed 's/G$/GB/')
+          echo "video_file=${FINAL_NAME}" >> $GITHUB_OUTPUT
+          echo "file_size=${FILE_SIZE}" >> $GITHUB_OUTPUT
+          echo "duration=0" >> $GITHUB_OUTPUT
+          echo "width=0" >> $GITHUB_OUTPUT
+          echo "height=0" >> $GITHUB_OUTPUT
+          echo "thumb=" >> $GITHUB_OUTPUT
+        else
+          EXT="mp4"
+          INPUT="${SAFE_TITLE}.${EXT}"
+          report 70 "downloading"
+          ffmpeg -i "$INPUT" -c copy -movflags +faststart "${SAFE_TITLE}_stream.mp4"
+          FINAL_NAME="${SAFE_TITLE}_stream.${EXT}"
+
+          FILE_SIZE=$(du -h "$FINAL_NAME" | cut -f1)
+          report 90 "downloading"
+
+          # Extract metadata for Bale
+          DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${SAFE_TITLE}_stream.mp4" 2>/dev/null | cut -d. -f1)
+          WIDTH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of csv=s=x:p=0 "${SAFE_TITLE}_stream.mp4" 2>/dev/null)
+          HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=s=x:p=0 "${SAFE_TITLE}_stream.mp4" 2>/dev/null)
+
+          # Find thumbnail
+          THUMB_FILE=""
+          for f in "${SAFE_TITLE}.jpg" "${SAFE_TITLE}.webp" "${SAFE_TITLE}.thumb.jpg"; do
+            if [ -f "$f" ]; then
+              THUMB_FILE="$f"
+              break
+            fi
+          done
+
+          echo "video_file=${FINAL_NAME}" >> $GITHUB_OUTPUT
+          echo "file_size=${FILE_SIZE}" >> $GITHUB_OUTPUT
+          echo "duration=${DURATION:-0}" >> $GITHUB_OUTPUT
+          echo "width=${WIDTH:-0}" >> $GITHUB_OUTPUT
+          echo "height=${HEIGHT:-0}" >> $GITHUB_OUTPUT
+          echo "thumb=${THUMB_FILE}" >> $GITHUB_OUTPUT
+
+          # Determine display quality from actual resolution
+          if [ "$QUALITY" = "best" ] && [ -n "$HEIGHT" ] && [ "$HEIGHT" != "0" ]; then
+            DISPLAY_QUALITY="${HEIGHT}p"
+          elif [ "$QUALITY" = "audio" ]; then
+            DISPLAY_QUALITY="audio"
+          else
+            DISPLAY_QUALITY="${QUALITY}p"
+          fi
+          echo "display_quality=${DISPLAY_QUALITY}" >> $GITHUB_OUTPUT
+          echo "Display quality: ${DISPLAY_QUALITY}"
+          echo "Metadata: duration=${DURATION:-0}s, ${WIDTH:-0}x${HEIGHT:-0}, size=${FILE_SIZE}"
+        fi
+
+        report 95 "downloading"
+
+    # ---------- Send to Bale (with retry on rate limit) ----------
+    - name: Send to Bale
+      env:
+        BALE_BOT_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
+        CHAT_ID: ${{ steps.inputs.outputs.chat_id }}
+        PROGRESS_MSG_ID: ${{ steps.inputs.outputs.progress_msg_id }}
+        TITLE: ${{ steps.title.outputs.raw_title }}
+        GROUP_CHAT_ID: ${{ steps.inputs.outputs.group_chat_id }}
+        THUMB_MSG_ID: ${{ steps.inputs.outputs.thumb_msg_id }}
+        DURATION: ${{ steps.download.outputs.duration }}
+        WIDTH: ${{ steps.download.outputs.width }}
+        HEIGHT: ${{ steps.download.outputs.height }}
+        THUMB_FILE: ${{ steps.download.outputs.thumb }}
+        FILE_SIZE: ${{ steps.download.outputs.file_size }}
+        DISPLAY_QUALITY: ${{ steps.download.outputs.display_quality }}
+      run: |
+        report() {
+          if [ -n "$CHAT_ID" ] && [ -n "$PROGRESS_MSG_ID" ]; then
+            curl -s -X POST "${{ vars.WORKER_URL }}/progress" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\":\"$CHAT_ID\",\"message_id\":\"$PROGRESS_MSG_ID\",\"progress\":\"$1\",\"status\":\"$2\",\"file_size\":\"${3:-}\",\"quality\":\"${4:-}\"}" > /dev/null 2>&1 || true
+          fi
+        }
+
+        send_with_retry() {
+          local API_URL="$1"; shift
+          local MAX_RETRIES=5
+          for i in $(seq 1 $MAX_RETRIES); do
+            RESP=$(curl -s -X POST "$API_URL" "$@")
+            ERROR_CODE=$(echo "$RESP" | grep -o '"error_code":[0-9]*' | head -1 | cut -d: -f2)
+            if [ "$ERROR_CODE" = "429" ]; then
+              RETRY_AFTER=$(echo "$RESP" | grep -o '"retry_after":[0-9]*' | head -1 | cut -d: -f2)
+              RETRY_AFTER=${RETRY_AFTER:-60}
+              echo "Rate limited. Waiting ${RETRY_AFTER}s (attempt $i/$MAX_RETRIES)"
+              sleep $((RETRY_AFTER + 2))
+              continue
+            fi
+            echo "$RESP"
+            return 0
+          done
+          echo '{"ok":false}'
+          return 1
+        }
+
+        report 98 "uploading"
+
+        FILE="${{ steps.download.outputs.video_file }}"
+        EXT="${FILE##*.}"
+        API_URL="https://tapi.bale.ai/bot${BALE_BOT_TOKEN}"
+
+        echo "Sending file: $FILE (size=${FILE_SIZE}, duration=${DURATION}s, ${WIDTH}x${HEIGHT})"
+
+        # Check file size against 50MB limit
+        FILE_BYTES=$(stat -c%s "$FILE" 2>/dev/null || echo 0)
+        if [ "$FILE_BYTES" -gt 52428800 ]; then
+          echo "File exceeds 50MB ($FILE_BYTES bytes). Splitting into ZIP parts..."
+          split_count=$(zip -s 45m "media_split.zip" "$FILE" 2>&1 | grep -oP 'creating.*split archive.*part \K[0-9]+' | tail -1)
+          # Count all split parts
+          TOTAL_PARTS=0
+          for sp in media_split.z*; do
+            if [ -f "$sp" ] && [[ ! "$sp" == *.zip ]]; then
+              TOTAL_PARTS=$((TOTAL_PARTS + 1))
+            fi
+          done
+          # Also count the main zip if it exists
+          if [ -f "media_split.zip" ]; then
+            TOTAL_PARTS=$((TOTAL_PARTS + 1))
+          fi
+          if [ "$TOTAL_PARTS" -eq 0 ]; then
+            echo "ERROR: Split produced no parts"
+            report 0 "error"
+            exit 1
+          fi
+          echo "Split into $TOTAL_PARTS parts"
+          PART_NUM=0
+          for sp in media_split.zip media_split.z[0-9]*; do
+            [ -f "$sp" ] || continue
+            PART_NUM=$((PART_NUM + 1))
+            echo "Sending part $PART_NUM/$TOTAL_PARTS: $sp"
+            RESP=$(send_with_retry "${API_URL}/sendDocument" \
+              -F chat_id="$CHAT_ID" \
+              -F document=@"$sp" \
+              -F caption="📦 Part ${PART_NUM}/${TOTAL_PARTS} — ${TITLE}")
+            MID=$(echo "$RESP" | grep -o '"message_id":[0-9]*' | head -1 | cut -d: -f2)
+            if [ -n "$MID" ] && [ "$MID" != "0" ]; then MSG_ID="$MID"; fi
+          done
+          # Send summary message
+          FILE_SIZE_MB=$(echo "scale=1; $FILE_BYTES / 1048576" | bc)
+          send_with_retry "${API_URL}/sendMessage" \
+            -F chat_id="$CHAT_ID" \
+            -F text="✅ ${TITLE} — ${FILE_SIZE_MB}MB in ${TOTAL_PARTS} parts" > /dev/null 2>&1 || true
+        else
+          MSG_ID=""
+          if [ "$EXT" = "mp4" ]; then
+            THUMB_ARGS=""
+            if [ -n "$THUMB_FILE" ] && [ -f "$THUMB_FILE" ]; then
+              THUMB_ARGS="-F thumb=@${THUMB_FILE}"
+            fi
+            RESP=$(send_with_retry "${API_URL}/sendVideo" \
+              -F chat_id="$CHAT_ID" \
+              -F video=@"$FILE" \
+              $THUMB_ARGS \
+              -F duration="$DURATION" \
+              -F width="$WIDTH" \
+              -F height="$HEIGHT" \
+              -F supports_streaming=true \
+              -F caption="🎬 ${TITLE}")
+          else
+            RESP=$(send_with_retry "${API_URL}/sendDocument" \
+              -F chat_id="$CHAT_ID" \
+              -F document=@"$FILE" \
+              -F caption="🎵 ${TITLE}")
+          fi
+          MSG_ID=$(echo "$RESP" | grep -o '"message_id":[0-9]*' | head -1 | cut -d: -f2)
+          if [ -z "$MSG_ID" ] || [ "$MSG_ID" = "0" ]; then
+            echo "ERROR: Failed to send file. Response: $RESP"
+            report 0 "error"
+            exit 1
+          fi
+          echo "Sent file, message ID: $MSG_ID"
+        fi
+
+        report 100 "done" "$FILE_SIZE" "$DISPLAY_QUALITY"
+
+        # Forward thumbnail + video to group if provided
+        if [ -n "$GROUP_CHAT_ID" ] && [ "$GROUP_CHAT_ID" != "null" ]; then
+          curl -s -X POST "https://tapi.bale.ai/bot${BALE_BOT_TOKEN}/forwardMessage" \
+            -d chat_id="$GROUP_CHAT_ID" \
+            -d from_chat_id="$CHAT_ID" \
+            -d message_id="$PROGRESS_MSG_ID" || true
+          if [ -n "$MSG_ID" ] && [ "$MSG_ID" != "null" ]; then
+            curl -s -X POST "https://tapi.bale.ai/bot${BALE_BOT_TOKEN}/forwardMessage" \
+              -d chat_id="$GROUP_CHAT_ID" \
+              -d from_chat_id="$CHAT_ID" \
+              -d message_id="$MSG_ID" || true
+          fi
+        fi

@@ -1,0 +1,238 @@
+name: GitHub Downloader
+
+on:
+  repository_dispatch:
+    types: [bale_download_github]
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'GitHub repo or release URL'
+        required: true
+
+jobs:
+  download-and-send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+    - name: Resolve inputs
+      id: inputs
+      run: |
+        URL="${{ github.event.client_payload.url || inputs.url }}"
+        CHAT_ID="${{ github.event.client_payload.chat_id || '' }}"
+        PROGRESS_MSG_ID="${{ github.event.client_payload.progress_msg_id || '' }}"
+        GROUP_CHAT_ID="${{ github.event.client_payload.group_chat_id || '' }}"
+
+        IS_ASSET=false
+        if echo "$URL" | grep -qE '/releases/download/'; then
+          IS_ASSET=true
+          OWNER=$(echo "$URL" | cut -d/ -f4)
+          REPO=$(echo "$URL" | cut -d/ -f5)
+          FILENAME=$(echo "$URL" | grep -oP '/releases/download/[^/]+/\K[^?]+')
+        elif echo "$URL" | grep -qE '/releases/tag/'; then
+          OWNER=$(echo "$URL" | cut -d/ -f4)
+          REPO=$(echo "$URL" | cut -d/ -f5)
+          TAG=$(echo "$URL" | grep -oP '/releases/tag/\K[^?]+')
+          FILENAME="${REPO}-${TAG}"
+        else
+          OWNER=$(echo "$URL" | cut -d/ -f4)
+          REPO=$(echo "$URL" | cut -d/ -f5 | sed 's/\.git$//')
+          FILENAME="${REPO}-source"
+        fi
+
+        echo "url=${URL}" >> $GITHUB_OUTPUT
+        echo "owner=${OWNER}" >> $GITHUB_OUTPUT
+        echo "repo=${REPO}" >> $GITHUB_OUTPUT
+        echo "is_asset=${IS_ASSET}" >> $GITHUB_OUTPUT
+        echo "filename=${FILENAME}" >> $GITHUB_OUTPUT
+        echo "chat_id=${CHAT_ID}" >> $GITHUB_OUTPUT
+        echo "progress_msg_id=${PROGRESS_MSG_ID}" >> $GITHUB_OUTPUT
+        echo "group_chat_id=${GROUP_CHAT_ID}" >> $GITHUB_OUTPUT
+
+    - name: Report progress
+      run: |
+        report() {
+          if [ -n "${{ steps.inputs.outputs.chat_id }}" ] && [ -n "${{ steps.inputs.outputs.progress_msg_id }}" ]; then
+            curl -s -X POST "${{ vars.WORKER_URL }}/progress" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\":\"${{ steps.inputs.outputs.chat_id }}\",\"message_id\":\"${{ steps.inputs.outputs.progress_msg_id }}\",\"progress\":\"$1\",\"status\":\"$2\",\"file_size\":\"${3:-}\",\"quality\":\"${4:-}\"}" > /dev/null 2>&1 || true
+          fi
+        }
+        report 10 "downloading"
+
+    - name: Download from GitHub
+      id: download
+      run: |
+        URL="${{ steps.inputs.outputs.url }}"
+        IS_ASSET="${{ steps.inputs.outputs.is_asset }}"
+        OWNER="${{ steps.inputs.outputs.owner }}"
+        REPO="${{ steps.inputs.outputs.repo }}"
+        FILENAME="${{ steps.inputs.outputs.filename }}"
+
+        rm -rf /tmp/gh_download
+        mkdir -p /tmp/gh_download
+
+        if [ "$IS_ASSET" = "true" ]; then
+          echo "Downloading single asset: $URL"
+          curl -fSL "$URL" -o "/tmp/gh_download/${FILENAME}" 2>/dev/null || true
+          if [ ! -s "/tmp/gh_download/${FILENAME}" ]; then
+            curl -fSL -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" "$URL" \
+              -o "/tmp/gh_download/${FILENAME}" 2>/dev/null || true
+          fi
+        elif echo "$URL" | grep -qE '/releases/tag/'; then
+          TAG=$(echo "$URL" | grep -oP '/releases/tag/\K[^?]+')
+          echo "Downloading all assets for release: $TAG"
+          API_URL="https://api.github.com/repos/${OWNER}/${REPO}/releases/tags/${TAG}"
+          RELEASE_JSON=$(curl -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" "$API_URL" 2>/dev/null || echo "{}")
+          echo "$RELEASE_JSON" | grep -o '"browser_download_url":"[^"]*"' | cut -d'"' -f4 | while read -r asset_url; do
+            FNAME=$(basename "$asset_url")
+            echo "Downloading: $FNAME"
+            curl -fSL "$asset_url" -o "/tmp/gh_download/${FNAME}" 2>/dev/null || true
+          done
+          if [ -z "$(ls -A /tmp/gh_download)" ]; then
+            echo "No assets, downloading source tarball..."
+            curl -fSL "https://github.com/${OWNER}/${REPO}/archive/refs/tags/${TAG}.tar.gz" \
+              -o "/tmp/gh_download/${FILENAME}.tar.gz" 2>/dev/null || true
+          fi
+        else
+          echo "Downloading source for ${OWNER}/${REPO}..."
+          report 20 "downloading" || true
+
+          echo "Using GitHub API zipball endpoint..."
+          curl -sL -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${OWNER}/${REPO}/zipball" \
+            -o "/tmp/gh_download/${REPO}.zip"
+
+          report 60 "downloading" || true
+
+          FSIZE=$(stat -c%s "/tmp/gh_download/${REPO}.zip" 2>/dev/null || echo 0)
+          echo "Downloaded zip: $FSIZE bytes"
+
+          if [ "$FSIZE" -lt 1000 ]; then
+            echo "Zip too small, trying tarball..."
+            rm -f "/tmp/gh_download/${REPO}.zip"
+            curl -sL -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${OWNER}/${REPO}/tarball" \
+              -o "/tmp/gh_download/${REPO}.tar.gz"
+            FSIZE2=$(stat -c%s "/tmp/gh_download/${REPO}.tar.gz" 2>/dev/null || echo 0)
+            echo "Tarball download: $FSIZE2 bytes"
+          fi
+        fi
+
+        cd /tmp/gh_download
+        FILE_COUNT=$(find . -maxdepth 1 -type f | wc -l)
+        TOTAL_SIZE=$(du -sh . 2>/dev/null | cut -f1)
+        echo "Downloaded $FILE_COUNT files, total: $TOTAL_SIZE"
+        ls -la
+
+        echo "file_count=${FILE_COUNT}" >> $GITHUB_OUTPUT
+        echo "total_size=${TOTAL_SIZE}" >> $GITHUB_OUTPUT
+
+    - name: Send to Bale
+      env:
+        BALE_BOT_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
+        CHAT_ID: ${{ steps.inputs.outputs.chat_id }}
+        PROGRESS_MSG_ID: ${{ steps.inputs.outputs.progress_msg_id }}
+        GROUP_CHAT_ID: ${{ steps.inputs.outputs.group_chat_id }}
+        OWNER: ${{ steps.inputs.outputs.owner }}
+        REPO: ${{ steps.inputs.outputs.repo }}
+        FILENAME: ${{ steps.inputs.outputs.filename }}
+        IS_ASSET: ${{ steps.inputs.outputs.is_asset }}
+        TOTAL_SIZE: ${{ steps.download.outputs.total_size }}
+        FILE_COUNT: ${{ steps.download.outputs.file_count }}
+      run: |
+        report() {
+          if [ -n "$CHAT_ID" ] && [ -n "$PROGRESS_MSG_ID" ]; then
+            curl -s -X POST "${{ vars.WORKER_URL }}/progress" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\":\"$CHAT_ID\",\"message_id\":\"$PROGRESS_MSG_ID\",\"progress\":\"$1\",\"status\":\"$2\",\"file_size\":\"${3:-}\",\"quality\":\"${4:-}\"}" > /dev/null 2>&1 || true
+          fi
+        }
+        send_with_retry() {
+          local API_URL="$1"; shift
+          for i in 1 2 3 4 5; do
+            RESP=$(curl -s -X POST "$API_URL" "$@" 2>/dev/null) || RESP='{"ok":false}'
+            ERROR_CODE=$(echo "$RESP" | grep -o '"error_code":[0-9]*' | head -1 | cut -d: -f2)
+            if [ "$ERROR_CODE" = "429" ]; then
+              RETRY_AFTER=$(echo "$RESP" | grep -o '"retry_after":[0-9]*' | head -1 | cut -d: -f2)
+              RETRY_AFTER=${RETRY_AFTER:-60}
+              sleep $((RETRY_AFTER + 2))
+              continue
+            fi
+            echo "$RESP"
+            return 0
+          done
+          echo '{"ok":false}'
+          return 1
+        }
+
+        cd /tmp/gh_download
+        API_URL="https://tapi.bale.ai/bot${BALE_BOT_TOKEN}"
+        MSG_ID=""
+        TOTAL_FILES=$(find . -maxdepth 1 -type f | wc -l)
+        SENT=0
+        report 70 "uploading" "$TOTAL_SIZE" "GitHub" || true
+
+        for f in *; do
+          [ -f "$f" ] || continue
+          SENT=$((SENT + 1))
+          FSIZE=$(stat -c%s "$f" 2>/dev/null || echo 0)
+          if [ "$FSIZE" -gt 1073741824 ]; then
+            SIZE_HR="$(echo "scale=1; $FSIZE/1073741824" | bc)GB"
+          elif [ "$FSIZE" -gt 1048576 ]; then
+            SIZE_HR="$(echo "scale=1; $FSIZE/1048576" | bc)MB"
+          elif [ "$FSIZE" -gt 1024 ]; then
+            SIZE_HR="$(echo "scale=1; $FSIZE/1024" | bc)KB"
+          else
+            SIZE_HR="${FSIZE}B"
+          fi
+
+          PROG=$((70 + SENT * 25 / TOTAL_FILES))
+          echo "Sending: $f ($SIZE_HR) [$PROG%]"
+
+          # Check individual file against 50MB limit
+          if [ "$FSIZE" -gt 52428800 ]; then
+            echo "File $f exceeds 50MB ($FSIZE bytes). Splitting..."
+            zip -s 45m "media_split.zip" "$f"
+            TOTAL_PARTS=0
+            for sp in media_split.zip media_split.z[0-9]*; do
+              [ -f "$sp" ] && TOTAL_PARTS=$((TOTAL_PARTS + 1))
+            done
+            echo "Split into $TOTAL_PARTS parts"
+            PART_NUM=0
+            for sp in media_split.zip media_split.z[0-9]*; do
+              [ -f "$sp" ] || continue
+              PART_NUM=$((PART_NUM + 1))
+              echo "Sending part $PART_NUM/$TOTAL_PARTS: $sp"
+              RESP=$(send_with_retry "${API_URL}/sendDocument" \
+                -F chat_id="$CHAT_ID" \
+                -F document=@"$sp" \
+                -F caption="📦 Part ${PART_NUM}/${TOTAL_PARTS} — ${f}")
+              MID=$(echo "$RESP" | grep -o '"message_id":[0-9]*' | head -1 | cut -d: -f2)
+              if [ -n "$MID" ] && [ "$MID" != "0" ]; then MSG_ID="$MID"; fi
+            done
+            FILE_SIZE_MB=$(echo "scale=1; $FSIZE / 1048576" | bc)
+            send_with_retry "${API_URL}/sendMessage" \
+              -F chat_id="$CHAT_ID" \
+              -F text="✅ ${f} — ${FILE_SIZE_MB}MB in ${TOTAL_PARTS} parts" > /dev/null 2>&1 || true
+            rm -f media_split.z*
+          else
+            RESP=$(send_with_retry "${API_URL}/sendDocument" \
+              -F chat_id="$CHAT_ID" \
+              -F document=@"$f" \
+              -F caption="📦 ${f} · ${SIZE_HR}") || true
+            MID=$(echo "$RESP" | grep -o '"message_id":[0-9]*' | head -1 | cut -d: -f2)
+            if [ -n "$MID" ] && [ "$MID" != "0" ]; then MSG_ID="$MID"; fi
+          fi
+          report "$PROG" "uploading" "$TOTAL_SIZE" "GitHub" || true
+        done
+
+        if [ -z "$MSG_ID" ] || [ "$MSG_ID" = "null" ]; then
+          report 0 "error" || true
+          exit 1
+        fi
+        report 100 "done" "$TOTAL_SIZE" "GitHub" || true
+        if [ -n "$GROUP_CHAT_ID" ] && [ "$GROUP_CHAT_ID" != "null" ]; then
+          curl -s -X POST "https://tapi.bale.ai/bot${BALE_BOT_TOKEN}/forwardMessage" -d chat_id="$GROUP_CHAT_ID" -d from_chat_id="$CHAT_ID" -d message_id="$MSG_ID" || true
+        fi
