@@ -1,0 +1,132 @@
+name: Spotify/iTunes MP3 Download
+
+on:
+  repository_dispatch:
+    types: [bale_download_spotify]
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Track URL'
+        required: true
+      track_name:
+        description: 'Track name for filename'
+        required: false
+
+jobs:
+  download-and-send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+    - name: Resolve inputs
+      id: inputs
+      run: |
+        URL="${{ github.event.client_payload.url || inputs.url }}"
+        TRACK_NAME="${{ github.event.client_payload.track_name || inputs.track_name || 'track' }}"
+        CHAT_ID="${{ github.event.client_payload.chat_id || '' }}"
+        PROGRESS_MSG_ID="${{ github.event.client_payload.progress_msg_id || '' }}"
+        echo "url=${URL}" >> $GITHUB_OUTPUT
+        echo "track_name=${TRACK_NAME}" >> $GITHUB_OUTPUT
+        echo "chat_id=${CHAT_ID}" >> $GITHUB_OUTPUT
+        echo "progress_msg_id=${PROGRESS_MSG_ID}" >> $GITHUB_OUTPUT
+
+    - name: Install yt-dlp
+      run: |
+        if [ ! -f /usr/local/bin/yt-dlp ]; then
+          sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
+          sudo chmod +x /usr/local/bin/yt-dlp
+        fi
+        echo "yt-dlp: $(yt-dlp --version)"
+
+    - name: Download MP3
+      id: download
+      env:
+        CHAT_ID: ${{ steps.inputs.outputs.chat_id }}
+        PROGRESS_MSG_ID: ${{ steps.inputs.outputs.progress_msg_id }}
+      run: |
+        report() {
+          if [ -n "$CHAT_ID" ] && [ -n "$PROGRESS_MSG_ID" ]; then
+            curl -s -X POST "${{ vars.WORKER_URL }}/progress" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\":\"$CHAT_ID\",\"message_id\":\"$PROGRESS_MSG_ID\",\"progress\":\"$1\",\"status\":\"$2\",\"file_size\":\"${3:-}\",\"quality\":\"${4:-}\"}" > /dev/null 2>&1 || true
+          fi
+        }
+
+        URL="${{ steps.inputs.outputs.url }}"
+        TRACK_NAME="${{ steps.inputs.outputs.track_name }}"
+
+        # Sanitize filename
+        SAFE_NAME=$(echo "$TRACK_NAME" | sed 's/[^a-zA-Z0-9\-]/_/g' | sed 's/__*/_/g' | cut -c1-100)
+
+        report 20 "downloading"
+
+        mkdir -p /tmp/spotify_dl && cd /tmp/spotify_dl
+
+        yt-dlp -x --audio-format mp3 --audio-quality 0 \
+          -o "${SAFE_NAME}.%(ext)s" \
+          "$URL" 2>&1 || true
+
+        report 80 "downloading"
+
+        # Find the downloaded file
+        FILE=""
+        for f in *.mp3; do [ -f "$f" ] && FILE="$f" && break; done
+        if [ -z "$FILE" ]; then
+          for f in *; do
+            EXT="${f##*.}"
+            if [ "$EXT" != "jpg" ] && [ "$EXT" != "png" ] && [ -f "$f" ]; then
+              FILE="$f"
+              break
+            fi
+          done
+        fi
+
+        if [ -z "$FILE" ] || [ ! -f "$FILE" ]; then
+          echo "ERROR: No file downloaded"
+          report 0 "error"
+          exit 1
+        fi
+
+        FILE_SIZE=$(du -h "$FILE" | cut -f1)
+        echo "file=${FILE}" >> $GITHUB_OUTPUT
+        echo "file_size=${FILE_SIZE}" >> $GITHUB_OUTPUT
+        echo "safe_name=${SAFE_NAME}" >> $GITHUB_OUTPUT
+        report 90 "downloading"
+
+    - name: Send MP3 to Bale
+      env:
+        BALE_BOT_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
+        CHAT_ID: ${{ steps.inputs.outputs.chat_id }}
+        PROGRESS_MSG_ID: ${{ steps.inputs.outputs.progress_msg_id }}
+        TRACK_NAME: ${{ steps.inputs.outputs.track_name }}
+        FILE: ${{ steps.download.outputs.file }}
+        FILE_SIZE: ${{ steps.download.outputs.file_size }}
+        SAFE_NAME: ${{ steps.download.outputs.safe_name }}
+      run: |
+        report() {
+          if [ -n "$CHAT_ID" ] && [ -n "$PROGRESS_MSG_ID" ]; then
+            curl -s -X POST "${{ vars.WORKER_URL }}/progress" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\":\"$CHAT_ID\",\"message_id\":\"$PROGRESS_MSG_ID\",\"progress\":\"$1\",\"status\":\"$2\",\"file_size\":\"${3:-}\",\"quality\":\"${4:-}\"}" > /dev/null 2>&1 || true
+          fi
+        }
+
+        cd /tmp/spotify_dl
+        API_URL="https://tapi.bale.ai/bot${BALE_BOT_TOKEN}"
+
+        report 95 "uploading"
+
+        # Send MP3 as audio with correct filename
+        RESP=$(curl -s -X POST "${API_URL}/sendAudio" \
+          -F chat_id="$CHAT_ID" \
+          -F audio=@"$FILE" \
+          -F title="$TRACK_NAME" \
+          -F performer="Downloaded via Bot")
+
+        MSG_ID=$(echo "$RESP" | grep -o '"message_id":[0-9]*' | head -1 | cut -d: -f2)
+        if [ -z "$MSG_ID" ] || [ "$MSG_ID" = "0" ]; then
+          echo "ERROR: Failed to send audio. Response: $RESP"
+          report 0 "error"
+          exit 1
+        fi
+
+        report 100 "done" "$FILE_SIZE" "Audio"
