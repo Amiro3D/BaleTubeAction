@@ -61,9 +61,10 @@ jobs:
 
         mkdir -p /tmp/spotify_dl && cd /tmp/spotify_dl
 
+        # Search YouTube for the track and download as MP3 (no auth needed)
         yt-dlp -x --audio-format mp3 --audio-quality 0 \
           -o "${SAFE_NAME}.%(ext)s" \
-          "$URL" 2>&1 || true
+          "ytsearch1:${TRACK_NAME}" 2>&1 || true
 
         report 80 "downloading"
 
