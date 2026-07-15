@@ -189,14 +189,15 @@ jobs:
           FILE_BYTES=$(stat -c%s "$VIDEO" 2>/dev/null || echo 0)
           if [ "$FILE_BYTES" -gt $SPLIT_BYTES ]; then
             echo "Video exceeds ${SPLIT_MB}MB ($FILE_BYTES bytes). Splitting..."
-            zip -s ${SPLIT_MB}m "media_split.zip" "$VIDEO"
+            ZIP_NAME="TikTok"
+            zip -s ${SPLIT_MB}m "${ZIP_NAME}.zip" "$VIDEO"
             TOTAL_PARTS=0
-            for sp in media_split.zip media_split.z[0-9]*; do
+            for sp in ${ZIP_NAME}.zip ${ZIP_NAME}.z[0-9]*; do
               [ -f "$sp" ] && TOTAL_PARTS=$((TOTAL_PARTS + 1))
             done
             echo "Split into $TOTAL_PARTS parts"
             PART_NUM=0
-            for sp in media_split.zip media_split.z[0-9]*; do
+            for sp in ${ZIP_NAME}.zip ${ZIP_NAME}.z[0-9]*; do
               [ -f "$sp" ] || continue
               PART_NUM=$((PART_NUM + 1))
               echo "Sending part $PART_NUM/$TOTAL_PARTS: $sp"
@@ -211,7 +212,7 @@ jobs:
             send_with_retry "${API_URL}/sendMessage" \
               -F chat_id="$CHAT_ID" \
               -F text="✅ TikTok — ${FILE_SIZE_MB}MB in ${TOTAL_PARTS} parts" > /dev/null 2>&1 || true
-            rm -f media_split.z*
+            rm -f ${ZIP_NAME}.z*
           else
             echo "Sending video: $VIDEO"
             RESP=$(send_with_retry "${API_URL}/sendVideo" \

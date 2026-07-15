@@ -267,6 +267,9 @@ jobs:
         EXT="${FILE##*.}"
         API_URL="https://tapi.bale.ai/bot${BALE_BOT_TOKEN}"
 
+        # Sanitize title for zip filename
+        ZIP_NAME=$(echo "$TITLE" | sed 's/[^a-zA-Z0-9\-]/_/g' | sed 's/__*/_/g' | cut -c1-80)
+
         echo "Sending file: $FILE (size=${FILE_SIZE}, duration=${DURATION}s, ${WIDTH}x${HEIGHT})"
 
         # Check file size against configurable split threshold (SPLIT_SIZE in MB, default 45)
@@ -275,18 +278,14 @@ jobs:
         FILE_BYTES=$(stat -c%s "$FILE" 2>/dev/null || echo 0)
         if [ "$FILE_BYTES" -gt "$SPLIT_BYTES" ]; then
           echo "File exceeds ${SPLIT_MB}MB ($FILE_BYTES bytes). Splitting into ZIP parts..."
-          split_count=$(zip -s ${SPLIT_MB}m "media_split.zip" "$FILE" 2>&1 | grep -oP 'creating.*split archive.*part \K[0-9]+' | tail -1)
+          zip -s ${SPLIT_MB}m "${ZIP_NAME}.zip" "$FILE"
           # Count all split parts
           TOTAL_PARTS=0
-          for sp in media_split.z*; do
-            if [ -f "$sp" ] && [[ ! "$sp" == *.zip ]]; then
+          for sp in ${ZIP_NAME}.z*; do
+            if [ -f "$sp" ]; then
               TOTAL_PARTS=$((TOTAL_PARTS + 1))
             fi
           done
-          # Also count the main zip if it exists
-          if [ -f "media_split.zip" ]; then
-            TOTAL_PARTS=$((TOTAL_PARTS + 1))
-          fi
           if [ "$TOTAL_PARTS" -eq 0 ]; then
             echo "ERROR: Split produced no parts"
             report 0 "error"
@@ -294,7 +293,7 @@ jobs:
           fi
           echo "Split into $TOTAL_PARTS parts"
           PART_NUM=0
-          for sp in media_split.zip media_split.z[0-9]*; do
+          for sp in ${ZIP_NAME}.zip ${ZIP_NAME}.z[0-9]*; do
             [ -f "$sp" ] || continue
             PART_NUM=$((PART_NUM + 1))
             echo "Sending part $PART_NUM/$TOTAL_PARTS: $sp"
