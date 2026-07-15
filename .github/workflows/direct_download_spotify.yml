@@ -27,11 +27,15 @@ jobs:
         echo "chat_id=${CHAT_ID}" >> $GITHUB_OUTPUT
         echo "progress_msg_id=${PROGRESS_MSG_ID}" >> $GITHUB_OUTPUT
 
+    - name: Checkout (for cookies.txt)
+      uses: actions/checkout@v4
+
     - name: Install yt-dlp
       run: |
         sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
         sudo chmod +x /usr/local/bin/yt-dlp
         echo "yt-dlp: $(yt-dlp --version)"
+        ls -la cookies.txt 2>/dev/null && echo "cookies.txt found" || echo "cookies.txt NOT found"
 
     - name: Download MP3
       id: download
@@ -54,8 +58,9 @@ jobs:
 
         mkdir -p /tmp/spotify_dl && cd /tmp/spotify_dl
 
-        # Try YouTube search first
+        # Try YouTube search with cookies
         yt-dlp -x --audio-format mp3 --audio-quality 0 \
+          --cookies cookies.txt \
           -o "${SAFE_NAME}.%(ext)s" \
           "ytsearch1:${TRACK_NAME}" 2>&1 || true
 
