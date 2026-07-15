@@ -12,7 +12,7 @@ on:
 jobs:
   screenshot:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 3
     steps:
     - name: Resolve inputs
       id: inputs
@@ -29,15 +29,16 @@ jobs:
       with:
         node-version: '20'
 
-    - name: Install Chromium + Puppeteer
-      env:
-        PUPPETEER_SKIP_DOWNLOAD: 'true'
-      run: |
-        sudo apt-get update -qq
-        sudo apt-get install -y -qq chromium-browser > /dev/null 2>&1 || sudo apt-get install -y -qq chromium > /dev/null 2>&1
-        CHROMIUM_PATH=$(which chromium-browser 2>/dev/null || which chromium 2>/dev/null || echo "")
-        echo "Chromium path: $CHROMIUM_PATH"
-        npm install puppeteer-core 2>&1 | tail -3
+    - name: Cache puppeteer-core
+      id: puppeteer-cache
+      uses: actions/cache@v4
+      with:
+        path: node_modules
+        key: puppeteer-core-${{ runner.os }}
+
+    - name: Install puppeteer-core
+      if: steps.puppeteer-cache.outputs.cache-hit != 'true'
+      run: npm install puppeteer-core
 
     - name: Take screenshot
       id: screenshot
@@ -56,14 +57,17 @@ jobs:
         URL="${{ steps.inputs.outputs.url }}"
         report 20 "downloading"
 
-        CHROMIUM_PATH=$(which chromium-browser 2>/dev/null || which chromium 2>/dev/null || echo "")
+        # Use pre-installed Chrome on GitHub Actions runners
+        CHROME=$(which google-chrome-stable 2>/dev/null || which google-chrome 2>/dev/null || which chromium-browser 2>/dev/null || which chromium 2>/dev/null || echo "")
+        echo "Chrome: $CHROME"
 
         cat > screenshot.js << 'SCRIPT'
         const puppeteer = require('puppeteer-core');
         (async () => {
           const url = process.argv[2];
+          const chromePath = process.argv[3];
           const browser = await puppeteer.launch({
-            executablePath: process.argv[3] || '/usr/bin/chromium-browser',
+            executablePath: chromePath,
             headless: 'new',
             args: [
               '--no-sandbox',
@@ -88,13 +92,13 @@ jobs:
               loaded = true;
               break;
             } catch (e) {
-              console.error('Attempt ' + (attempt+1) + ' failed: ' + e.message);
+              console.error('Attempt ' + (attempt+1) + ': ' + e.message);
               if (attempt < 2) {
                 try {
                   await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
                   loaded = true;
                   break;
-                } catch (e2) { /* next attempt */ }
+                } catch (e2) {}
               }
             }
           }
@@ -102,10 +106,7 @@ jobs:
 
           await new Promise(r => setTimeout(r, 1000));
 
-          // Full page screenshot
           await page.screenshot({ path: 'screenshot_full.png', fullPage: true });
-
-          // Viewport screenshot (preview)
           await page.screenshot({ path: 'screenshot_preview.png', fullPage: false });
 
           await browser.close();
@@ -113,7 +114,7 @@ jobs:
         })();
         SCRIPT
 
-        node screenshot.js "$URL" "$CHROMIUM_PATH" 2>&1
+        node screenshot.js "$URL" "$CHROME" 2>&1
 
         if [ ! -f "screenshot_full.png" ]; then
           echo "ERROR: Screenshot failed"
@@ -123,8 +124,6 @@ jobs:
 
         FULL_SIZE=$(stat -c%s "screenshot_full.png" 2>/dev/null || stat -f%z "screenshot_full.png" 2>/dev/null || echo 0)
         echo "full_size=${FULL_SIZE}" >> $GITHUB_OUTPUT
-        echo "Screenshot taken: ${FULL_SIZE} bytes"
-
         report 80 "downloading" "$FULL_SIZE"
 
     - name: Send to Bale
@@ -143,13 +142,11 @@ jobs:
 
         API_URL="https://tapi.bale.ai/bot${BALE_BOT_TOKEN}"
 
-        # Send full resolution as document
-        RESP=$(curl -s -X POST "${API_URL}/sendDocument" \
+        curl -s -X POST "${API_URL}/sendDocument" \
           -F chat_id="$CHAT_ID" \
           -F document=@screenshot_full.png \
-          -F caption="📸 Full resolution screenshot")
+          -F caption="📸 Full resolution screenshot"
 
-        # Send preview as photo
         curl -s -X POST "${API_URL}/sendPhoto" \
           -F chat_id="$CHAT_ID" \
           -F photo=@screenshot_preview.png \
