@@ -93,6 +93,8 @@ jobs:
     - name: Report progress
       id: progress
       run: |
+        CHAT_ID="${{ steps.inputs.outputs.chat_id }}"
+        PROGRESS_MSG_ID="${{ steps.inputs.outputs.progress_msg_id }}"
         report_progress() {
           if [ -n "$CHAT_ID" ] && [ -n "$PROGRESS_MSG_ID" ]; then
             curl -s -X POST "${{ vars.WORKER_URL }}/progress" \
@@ -100,9 +102,6 @@ jobs:
               -d "{\"chat_id\":\"$CHAT_ID\",\"message_id\":\"$PROGRESS_MSG_ID\",\"progress\":\"$1\",\"status\":\"$2\",\"file_size\":\"${3:-}\",\"quality\":\"${4:-}\"}" > /dev/null 2>&1 || true
           fi
         }
-        echo "CHAT_ID=${{ steps.inputs.outputs.chat_id }}" >> $GITHUB_OUTPUT
-        echo "PROGRESS_MSG_ID=${{ steps.inputs.outputs.progress_msg_id }}" >> $GITHUB_OUTPUT
-        # Test connectivity
         report_progress 0 "downloading"
 
     # ---------- Get video title ----------
