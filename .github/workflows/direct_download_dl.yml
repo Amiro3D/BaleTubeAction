@@ -1,0 +1,181 @@
+name: Direct Link Download
+
+on:
+  repository_dispatch:
+    types: [bale_download_direct]
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Download URL'
+        required: true
+
+jobs:
+  download-and-send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+    - name: Checkout (for split support)
+      uses: actions/checkout@v4
+
+    - name: Resolve inputs
+      id: inputs
+      run: |
+        URL="${{ github.event.client_payload.url || inputs.url }}"
+        CHAT_ID="${{ github.event.client_payload.chat_id || '' }}"
+        PROGRESS_MSG_ID="${{ github.event.client_payload.progress_msg_id || '' }}"
+        SPLIT_SIZE="${{ github.event.client_payload.split_size || '45' }}"
+        echo "url=${URL}" >> $GITHUB_OUTPUT
+        echo "chat_id=${CHAT_ID}" >> $GITHUB_OUTPUT
+        echo "progress_msg_id=${PROGRESS_MSG_ID}" >> $GITHUB_OUTPUT
+        echo "split_size=${SPLIT_SIZE}" >> $GITHUB_OUTPUT
+
+    - name: Download file
+      id: download
+      env:
+        CHAT_ID: ${{ steps.inputs.outputs.chat_id }}
+        PROGRESS_MSG_ID: ${{ steps.inputs.outputs.progress_msg_id }}
+      run: |
+        report() {
+          if [ -n "$CHAT_ID" ] && [ -n "$PROGRESS_MSG_ID" ]; then
+            curl -s -X POST "${{ vars.WORKER_URL }}/progress" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\":\"$CHAT_ID\",\"message_id\":\"$PROGRESS_MSG_ID\",\"progress\":\"$1\",\"status\":\"$2\",\"file_size\":\"${3:-}\",\"quality\":\"${4:-}\"}" > /dev/null 2>&1 || true
+          fi
+        }
+
+        URL="${{ steps.inputs.outputs.url }}"
+        report 10 "downloading"
+
+        mkdir -p /tmp/dl_work && cd /tmp/dl_work
+
+        # Try with browser headers first (works for most sites)
+        HTTP_CODE=$(curl -L -f -s -w "%{http_code}" \
+          -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" \
+          -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
+          -H "Accept-Language: en-US,en;q=0.9" \
+          -H "Referer: $(echo "$URL" | sed 's|^\(https\?://[^/]*\).*|\1|')" \
+          -o "downloaded_file" \
+          "$URL" 2>/dev/null || echo "000")
+
+        # If browser headers failed, try direct
+        if [ "$HTTP_CODE" = "000" ] || [ "$HTTP_CODE" = "000" ] || [ ! -s "downloaded_file" ]; then
+          echo "Browser headers failed, trying direct download..."
+          curl -fSL -o "downloaded_file" "$URL" 2>&1 || true
+        fi
+
+        if [ ! -s "downloaded_file" ]; then
+          echo "ERROR: Download failed"
+          report 0 "error"
+          exit 1
+        fi
+
+        FILE_SIZE=$(stat -c%s "downloaded_file" 2>/dev/null || stat -f%z "downloaded_file" 2>/dev/null || echo 0)
+        echo "Downloaded: $FILE_SIZE bytes"
+
+        # Get filename from URL
+        RAW_NAME=$(basename "$URL" | sed 's/[?#].*//')
+        if [ -z "$RAW_NAME" ] || [ "$RAW_NAME" = "index.html" ] || [ "$RAW_NAME" = "/" ]; then
+          RAW_NAME="download"
+        fi
+        # Remove extension from raw name for clean naming
+        FILE_EXT="${RAW_NAME##*.}"
+        if [ "$FILE_EXT" = "$RAW_NAME" ]; then
+          FILE_EXT=""
+        fi
+        BASE_NAME=$(echo "$RAW_NAME" | sed 's/\.[^.]*$//')
+        SAFE_NAME=$(echo "$BASE_NAME" | sed 's/[^a-zA-Z0-9\-]/_/g' | sed 's/__*/_/g' | cut -c1-100)
+
+        echo "file=downloaded_file" >> $GITHUB_OUTPUT
+        echo "file_ext=${FILE_EXT}" >> $GITHUB_OUTPUT
+        echo "file_size=${FILE_SIZE}" >> $GITHUB_OUTPUT
+        echo "safe_name=${SAFE_NAME}" >> $GITHUB_OUTPUT
+
+        report 80 "uploading" "$FILE_SIZE"
+
+    - name: Send to Bale
+      if: steps.download.outputs.file != ''
+      env:
+        BALE_BOT_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
+        CHAT_ID: ${{ steps.inputs.outputs.chat_id }}
+        FILE_SIZE: ${{ steps.download.outputs.file_size }}
+        SAFE_NAME: ${{ steps.download.outputs.safe_name }}
+        SPLIT_SIZE: ${{ steps.inputs.outputs.split_size }}
+      run: |
+        report() {
+          if [ -n "$CHAT_ID" ]; then
+            curl -s -X POST "${{ vars.WORKER_URL }}/progress" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\":\"$CHAT_ID\",\"message_id\":\"\",\"progress\":\"100\",\"status\":\"done\"}" > /dev/null 2>&1 || true
+          fi
+        }
+
+        cd /tmp/dl_work
+        API_URL="https://tapi.bale.ai/bot${BALE_BOT_TOKEN}"
+
+        send_with_retry() {
+          local API_URL="$1"; shift
+          local MAX_RETRIES=5
+          for i in $(seq 1 $MAX_RETRIES); do
+            RESP=$(curl -s -X POST "$API_URL" "$@")
+            ERROR_CODE=$(echo "$RESP" | grep -o '"error_code":[0-9]*' | head -1 | cut -d: -f2)
+            if [ "$ERROR_CODE" = "429" ]; then
+              RETRY_AFTER=$(echo "$RESP" | grep -o '"retry_after":[0-9]*' | head -1 | cut -d: -f2)
+              RETRY_AFTER=${RETRY_AFTER:-60}
+              echo "Rate limited. Waiting ${RETRY_AFTER}s (attempt $i/$MAX_RETRIES)"
+              sleep $((RETRY_AFTER + 2))
+              continue
+            fi
+            echo "$RESP"
+            return 0
+          done
+          echo '{"ok":false}'
+          return 1
+        }
+
+        FILE="downloaded_file"
+        FILE_BYTES=$(stat -c%s "$FILE" 2>/dev/null || stat -f%z "$FILE" 2>/dev/null || echo 0)
+        SPLIT_MB="${SPLIT_SIZE:-45}"
+        SPLIT_BYTES=$((SPLIT_MB * 1048576))
+
+        if [ "$FILE_BYTES" -gt "$SPLIT_BYTES" ]; then
+          echo "File exceeds ${SPLIT_MB}MB ($FILE_BYTES bytes). Splitting..."
+          zip -s ${SPLIT_MB}m "${SAFE_NAME}.zip" "$FILE"
+          TOTAL_PARTS=0
+          for sp in ${SAFE_NAME}.z*; do
+            [ -f "$sp" ] && TOTAL_PARTS=$((TOTAL_PARTS + 1))
+          done
+          if [ "$TOTAL_PARTS" -eq 0 ]; then
+            echo "ERROR: Split produced no parts"
+            report 0 "error"
+            exit 1
+          fi
+          echo "Split into $TOTAL_PARTS parts"
+          PART_NUM=0
+          for sp in ${SAFE_NAME}.zip ${SAFE_NAME}.z[0-9]*; do
+            [ -f "$sp" ] || continue
+            PART_NUM=$((PART_NUM + 1))
+            echo "Sending part $PART_NUM/$TOTAL_PARTS: $sp"
+            RESP=$(send_with_retry "${API_URL}/sendDocument" \
+              -F chat_id="$CHAT_ID" \
+              -F document=@"$sp" \
+              -F caption="📦 Part ${PART_NUM}/${TOTAL_PARTS} — ${SAFE_NAME}")
+          done
+          FILE_SIZE_MB=$(echo "scale=1; $FILE_BYTES / 1048576" | bc)
+          send_with_retry "${API_URL}/sendMessage" \
+            -F chat_id="$CHAT_ID" \
+            -F text="✅ Download complete — ${FILE_SIZE_MB}MB in ${TOTAL_PARTS} parts" > /dev/null 2>&1 || true
+        else
+          RESP=$(send_with_retry "${API_URL}/sendDocument" \
+            -F chat_id="$CHAT_ID" \
+            -F document=@"$FILE" \
+            -F caption="📥 ${SAFE_NAME}")
+          MSG_ID=$(echo "$RESP" | grep -o '"message_id":[0-9]*' | head -1 | cut -d: -f2)
+          if [ -z "$MSG_ID" ] || [ "$MSG_ID" = "0" ]; then
+            echo "ERROR: Failed to send file. Response: $RESP"
+            report 0 "error"
+            exit 1
+          fi
+        fi
+
+        report
+        rm -rf /tmp/dl_work
