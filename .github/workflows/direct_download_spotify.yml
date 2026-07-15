@@ -58,9 +58,13 @@ jobs:
 
         mkdir -p /tmp/spotify_dl && cd /tmp/spotify_dl
 
-        # Try YouTube search with cookies
+        # Use absolute path to cookies.txt from checkout
+        COOKIES_PATH="${GITHUB_WORKSPACE}/cookies.txt"
+        echo "Cookies file: $COOKIES_PATH"
+        ls -la "$COOKIES_PATH" 2>/dev/null || echo "WARNING: cookies.txt not found"
+
         yt-dlp -x --audio-format mp3 --audio-quality 0 \
-          --cookies cookies.txt \
+          --cookies "$COOKIES_PATH" \
           -o "${SAFE_NAME}.%(ext)s" \
           "ytsearch1:${TRACK_NAME}" 2>&1 || true
 
