@@ -1,0 +1,88 @@
+name: Image Download
+
+on:
+  repository_dispatch:
+    types: [bale_image_download]
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+    - name: Download and send image
+      env:
+        BALE_BOT_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
+        QUERY: ${{ github.event.client_payload.query }}
+        PAGE: ${{ github.event.client_payload.page || '1' }}
+        INDEX: ${{ github.event.client_payload.index || '0' }}
+        CHAT_ID: ${{ github.event.client_payload.chat_id }}
+      run: |
+        set -e
+        API="https://tapi.bale.ai/bot${BALE_BOT_TOKEN}"
+
+        encode() { python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$1"; }
+
+        # Get vqd token
+        VQD=$(curl -sS -L \
+          -H "User-Agent: Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1" \
+          -H "Accept: text/html,application/xhtml+xml" \
+          -H "Accept-Language: en-US,en;q=0.9" \
+          "https://duckduckgo.com/?q=$(encode "$QUERY")&iar=images&iax=images&ia=images" \
+          | grep -oP 'vqd="[^"]*"' | head -1 | sed 's/vqd="//;s/"//')
+
+        if [ -z "$VQD" ]; then
+          curl -s -X POST "$API/sendMessage" -F "chat_id=$CHAT_ID" -F "text=❌ Download failed: search error" > /dev/null
+          exit 0
+        fi
+
+        # Get image results
+        RESP=$(curl -sS -L \
+          -H "User-Agent: Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1" \
+          "https://duckduckgo.com/i.js?l=us-en&o=json&q=$(encode "$QUERY")&vqd=${VQD}&f=,,,,,&p=${PAGE}")
+
+        # Extract the specific image URL
+        IMG_URL=$(echo "$RESP" | python3 -c "
+        import sys, json
+        try:
+            data = json.load(sys.stdin)
+            results = data.get('results', [])
+            idx = int(sys.argv[1])
+            if idx < len(results):
+                print(results[idx].get('image', ''))
+        except:
+            pass
+        " "$INDEX")
+
+        if [ -z "$IMG_URL" ]; then
+          curl -s -X POST "$API/sendMessage" -F "chat_id=$CHAT_ID" -F "text=❌ Image not found. Try searching again." > /dev/null
+          exit 0
+        fi
+
+        # Download the full-res image
+        FILE="/tmp/img_$$.jpg"
+        HTTP_CODE=$(curl -sS -L -o "$FILE" -w "%{http_code}" \
+          -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+          -H "Accept: image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8" \
+          -H "Referer: https://duckduckgo.com/" \
+          "$IMG_URL" || true)
+
+        if [ "$HTTP_CODE" != "200" ] || [ ! -s "$FILE" ]; then
+          curl -s -X POST "$API/sendMessage" -F "chat_id=$CHAT_ID" -F "text=❌ Failed to download image (HTTP $HTTP_CODE)" > /dev/null
+          rm -f "$FILE"
+          exit 0
+        fi
+
+        # Send the full-res image
+        RESP=$(curl -s -X POST "$API/sendPhoto" \
+          -F "chat_id=$CHAT_ID" \
+          -F "photo=@$FILE" \
+          -F "caption=📸 Full resolution")
+
+        # Check for error — try as document if photo fails
+        if echo "$RESP" | grep -q '"ok":false'; then
+          curl -s -X POST "$API/sendDocument" \
+            -F "chat_id=$CHAT_ID" \
+            -F "document=@$FILE" > /dev/null 2>&1 || true
+        fi
+
+        rm -f "$FILE"

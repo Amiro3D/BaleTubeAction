@@ -1,0 +1,119 @@
+name: Image Search
+
+on:
+  repository_dispatch:
+    types: [bale_image_search]
+
+jobs:
+  search:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+    - name: Search and send images
+      env:
+        BALE_BOT_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
+        QUERY: ${{ github.event.client_payload.query }}
+        PAGE: ${{ github.event.client_payload.page || '1' }}
+        CHAT_ID: ${{ github.event.client_payload.chat_id }}
+        MSG_ID: ${{ github.event.client_payload.msg_id || '' }}
+      run: |
+        set -e
+        API="https://tapi.bale.ai/bot${BALE_BOT_TOKEN}"
+
+        encode() { python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$1"; }
+
+        # Get vqd token
+        VQD=$(curl -sS -L \
+          -H "User-Agent: Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1" \
+          -H "Accept: text/html,application/xhtml+xml" \
+          -H "Accept-Language: en-US,en;q=0.9" \
+          "https://duckduckgo.com/?q=$(encode "$QUERY")&iar=images&iax=images&ia=images" \
+          | grep -oP 'vqd="[^"]*"' | head -1 | sed 's/vqd="//;s/"//')
+
+        if [ -z "$VQD" ]; then
+          curl -s -X POST "$API/sendMessage" -F "chat_id=$CHAT_ID" -F "text=🔍 No images found for this query." > /dev/null
+          exit 0
+        fi
+
+        # Get image results
+        RESP=$(curl -sS -L \
+          -H "User-Agent: Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1" \
+          "https://duckduckgo.com/i.js?l=us-en&o=json&q=$(encode "$QUERY")&vqd=${VQD}&f=,,,,,&p=${PAGE}")
+
+        # Parse results
+        RESULTS=$(echo "$RESP" | python3 -c "
+        import sys, json
+        try:
+            data = json.load(sys.stdin)
+            results = data.get('results', [])[:6]
+            if not results:
+                print('[]')
+                sys.exit(0)
+            out = [{'t': r.get('thumbnail',''), 'u': r.get('image','')} for r in results]
+            print(json.dumps(out))
+        except:
+            print('[]')
+        ")
+
+        COUNT=$(echo "$RESULTS" | python3 -c "import sys,json;print(len(json.load(sys.stdin)))")
+
+        if [ "$COUNT" = "0" ]; then
+          if [ -n "$MSG_ID" ]; then
+            curl -s -X POST "$API/editMessageText" \
+              -F "chat_id=$CHAT_ID" -F "message_id=$MSG_ID" \
+              -F "text=🔍 No more images" > /dev/null
+          else
+            curl -s -X POST "$API/sendMessage" -F "chat_id=$CHAT_ID" -F "text=🔍 No images found" > /dev/null
+          fi
+          exit 0
+        fi
+
+        # Delete progress/old message if paginating
+        if [ -n "$MSG_ID" ]; then
+          curl -s -X POST "$API/deleteMessage" -F "chat_id=$CHAT_ID" -F "message_id=$MSG_ID" > /dev/null 2>&1 || true
+        fi
+
+        # Send each thumbnail with download button
+        # callback_data format: imgd:{query}:{page}:{index}
+        python3 - "$RESULTS" "$QUERY" "$PAGE" "$CHAT_ID" "$API" << 'PYEOF'
+        import json, subprocess, sys, urllib.parse
+
+        results = json.loads(sys.argv[1])
+        query = sys.argv[2]
+        page = sys.argv[3]
+        chat_id = sys.argv[4]
+        api = sys.argv[5]
+
+        def send_photo(photo, keyboard=None):
+            cmd = ['curl', '-s', '-X', 'POST', f'{api}/sendPhoto',
+                   '-F', f'chat_id={chat_id}',
+                   '-F', f'photo={photo}']
+            if keyboard:
+                cmd.extend(['-F', f'reply_markup={json.dumps(keyboard)}'])
+            subprocess.run(cmd, capture_output=True)
+
+        def send_msg(text, keyboard=None):
+            cmd = ['curl', '-s', '-X', 'POST', f'{api}/sendMessage',
+                   '-F', f'chat_id={chat_id}',
+                   '-F', f'text={text}']
+            if keyboard:
+                cmd.extend(['-F', f'reply_markup={json.dumps(keyboard)}'])
+            subprocess.run(cmd, capture_output=True)
+
+        # Send thumbnails with individual download buttons
+        for i, r in enumerate(results):
+            # Callback: imgd:{query_encoded}:{page}:{index}
+            cb = f"imgd:{urllib.parse.quote(query)}:{page}:{i}"
+            kb = {"inline_keyboard": [[{"text": "⬇️ Download Full Resolution", "callback_data": cb}]]}
+            send_photo(r['t'], kb)
+
+        # Navigation message
+        nav = []
+        pg = int(page)
+        if pg > 1:
+            nav.append({"text": "⬅️ Back", "callback_data": f"imgb:{pg-1}:{urllib.parse.quote(query)}"})
+        nav.append({"text": "➡️ Next", "callback_data": f"imgn:{pg+1}:{urllib.parse.quote(query)}"})
+        nav.append({"text": "❌ Close", "callback_data": "imgx"})
+        kb = {"inline_keyboard": [nav]}
+        send_msg(f'🖼 "{query}" — Page {page}', kb)
+        PYEOF
