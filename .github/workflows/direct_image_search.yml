@@ -16,6 +16,7 @@ jobs:
         PAGE: ${{ github.event.client_payload.page || '1' }}
         CHAT_ID: ${{ github.event.client_payload.chat_id }}
         MSG_ID: ${{ github.event.client_payload.msg_id || '' }}
+        WORKER_URL: ${{ secrets.WORKER_URL }}
       run: |
         set -e
         API="https://tapi.bale.ai/bot${BALE_BOT_TOKEN}"
@@ -68,13 +69,22 @@ jobs:
           exit 0
         fi
 
+        # Store full-res URLs in worker KV
+        FULL_URLS=$(echo "$RESULTS" | python3 -c "
+        import sys, json
+        data = json.load(sys.stdin)
+        print(json.dumps([r['u'] for r in data]))
+        ")
+        curl -s -X POST "${WORKER_URL}/store-image-urls" \
+          -H "Content-Type: application/json" \
+          -d "{\"chat_id\":\"$CHAT_ID\",\"page\":\"$PAGE\",\"urls\":$FULL_URLS}" > /dev/null 2>&1 || true
+
         # Delete progress/old message if paginating
         if [ -n "$MSG_ID" ]; then
           curl -s -X POST "$API/deleteMessage" -F "chat_id=$CHAT_ID" -F "message_id=$MSG_ID" > /dev/null 2>&1 || true
         fi
 
         # Send each thumbnail with download button
-        # callback_data format: imgd:{query}:{page}:{index}
         python3 - "$RESULTS" "$QUERY" "$PAGE" "$CHAT_ID" "$API" << 'PYEOF'
         import json, subprocess, sys, urllib.parse
 
@@ -102,7 +112,6 @@ jobs:
 
         # Send thumbnails with individual download buttons
         for i, r in enumerate(results):
-            # Callback: imgd:{query_encoded}:{page}:{index}
             cb = f"imgd:{urllib.parse.quote(query)}:{page}:{i}"
             kb = {"inline_keyboard": [[{"text": "⬇️ Download Full Resolution", "callback_data": cb}]]}
             send_photo(r['t'], kb)
