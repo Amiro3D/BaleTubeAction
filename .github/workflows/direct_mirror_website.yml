@@ -10,7 +10,7 @@ jobs:
     timeout-minutes: 5
     steps:
     - name: Install dependencies
-      run: pip install requests beautifulsoup4 lxml jsbeautifier 2>/dev/null || pip3 install requests beautifulsoup4 lxml jsbeautifier 2>/dev/null || true
+      run: pip install requests beautifulsoup4 lxml 2>/dev/null || pip3 install requests beautifulsoup4 lxml 2>/dev/null || true
 
     - name: Mirror website
       env:
@@ -21,7 +21,7 @@ jobs:
       run: |
         set -e
         python3 - "$TARGET_URL" "$CHAT_ID" "$PROGRESS_MSG_ID" "$BALE_BOT_TOKEN" << 'PYEOF'
-        import os, sys, re, json, hashlib, mimetypes, zipfile, shutil, tempfile
+        import os, sys, re, json, hashlib, mimetypes, zipfile, shutil, tempfile, base64
         from urllib.parse import urljoin, urlparse, unquote, urldefrag
         from pathlib import Path
 
@@ -38,7 +38,7 @@ jobs:
         session = requests.Session()
         session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+            'Accept': '*/*',
             'Accept-Language': 'en-US,en;q=0.9',
         })
 
@@ -59,66 +59,37 @@ jobs:
             return full
 
         def url_to_local(abs_url):
-            """URL path -> local file path preserving directory structure."""
             p = urlparse(abs_url)
             path = unquote(p.path).lstrip('/')
             if not path: return 'index.html'
-            # If last segment has no extension, it's a page
             parts = path.split('/')
-            if '.' not in parts[-1]:
-                path += '.html'
+            if '.' not in parts[-1]: path += '.html'
             return path
 
-        downloaded = set()
+        downloaded = {}
 
-        def download(abs_url, work_dir):
-            """Download URL, save preserving path structure. Return local relative path."""
-            if not abs_url or abs_url.startswith('data:') or abs_url in downloaded:
-                local = url_to_local(abs_url) if abs_url not in ('', None) else None
-                return local if local and (work_dir / local).exists() else None
-
-            local = url_to_local(abs_url)
-            fpath = work_dir / local
-            if fpath.exists():
-                downloaded.add(abs_url)
-                return local
-
+        def download(abs_url):
+            """Download URL, return (local_path, content_bytes)."""
+            if not abs_url or abs_url.startswith('data:'):
+                return None, None
+            if abs_url in downloaded:
+                return downloaded[abs_url]
             try:
                 r = session.get(abs_url, timeout=TIMEOUT)
                 r.raise_for_status()
-                fpath.parent.mkdir(parents=True, exist_ok=True)
-                fpath.write_bytes(r.content)
-                downloaded.add(abs_url)
-                return local
+                local = url_to_local(abs_url)
+                downloaded[abs_url] = (local, r.content)
+                return local, r.content
             except:
-                return None
+                return None, None
 
-        def beautify_js(code):
-            try:
-                import jsbeautifier
-                opts = jsbeautifier.default_options()
-                opts.indent_size = 2
-                result = jsbeautifier.beautify(code, opts)
-                return result if len(result) > len(code) * 1.1 else code
-            except: return code
+        def to_data_uri(content, content_type):
+            """Convert bytes to data URI."""
+            b64 = base64.b64encode(content).decode()
+            return f"data:{content_type};base64,{b64}"
 
-        def process_css(css_text, css_url, work_dir):
-            def rep_import(m):
-                u = m.group(1).strip().strip("'\"")
-                if u.startswith('data:'): return m.group(0)
-                full = resolve(u, css_url)
-                loc = download(full, work_dir)
-                return f'@import url("{loc}");' if loc else m.group(0)
-            css_text = re.sub(r'@import\s+["\']?([^"\';\)]+)["\']?\s*;', rep_import, css_text)
-
-            def rep_url(m):
-                u = m.group(1).strip().strip("'\"")
-                if u.startswith('data:') or u.startswith('#'): return m.group(0)
-                full = resolve(u, css_url)
-                loc = download(full, work_dir)
-                return f'url("{loc}")' if loc else m.group(0)
-            css_text = re.sub(r'url\(([^)]+)\)', rep_url, css_text)
-            return css_text
+        def mimetoext(ct):
+            return mimetypes.guess_extension(ct.split(';')[0].strip()) or ''
 
         # ── Fetch page ──
         try:
@@ -127,61 +98,131 @@ jobs:
             final_url = resp.url
             html = resp.text
         except Exception as e:
-            api('sendMessage', data={'chat_id': CHAT_ID, 'text': f'❌ Failed to fetch page: {e}'})
+            api('sendMessage', data={'chat_id': CHAT_ID, 'text': f'❌ Failed to fetch: {e}'})
             sys.exit(0)
 
         parsed_page = urlparse(final_url)
         work = tempfile.mkdtemp()
         work_dir = Path(work)
-        total = 0
+        total_files = 0
 
         soup = BeautifulSoup(html, 'lxml')
 
-        # ── CSS links ──
+        # ── REMOVE <base> tag (causes CORS on file://) ──
+        for base in soup.find_all('base'):
+            base.decompose()
+
+        # ── Strip type="module" from scripts (can't load from file://) ──
+        for script in soup.find_all('script', type='module'):
+            del script['type']
+
+        # ── CSS: download and inline as <style> ──
         for link in soup.find_all('link', rel='stylesheet'):
             href = link.get('href')
             if not href: continue
             full = resolve(href, final_url)
-            progress(f'🌐 Mirroring...\n\n📥 CSS: {full[:60]}...')
-            local = download(full, work_dir)
-            if local:
-                try:
-                    r = session.get(full, timeout=TIMEOUT)
-                    css = process_css(r.text, full, work_dir)
-                    (work_dir / local).write_text(css, encoding='utf-8')
-                except: pass
-                link['href'] = local
-                total += 1
+            progress(f'🌐 Mirroring...\n\n📥 CSS: {full.split("/")[-1][:50]}...')
+            local, content = download(full)
+            if content:
+                css_text = content.decode('utf-8', errors='replace')
 
-        # ── Inline <style> ──
+                # Process @import - inline imported CSS
+                def imp_replace(m):
+                    imp_url = m.group(1).strip().strip("'\"")
+                    if imp_url.startswith('data:'): return m.group(0)
+                    imp_full = resolve(imp_url, full)
+                    _, imp_content = download(imp_full)
+                    if imp_content:
+                        return imp_content.decode('utf-8', errors='replace')
+                    return m.group(0)
+                css_text = re.sub(r'@import\s+["\']?([^"\';\)]+)["\']?\s*;', imp_replace, css_text)
+
+                # Process url() - convert fonts to data URIs, keep images as files
+                def css_url_replace(m):
+                    u = m.group(1).strip().strip("'\"")
+                    if u.startswith('data:') or u.startswith('#'): return m.group(0)
+                    url_full = resolve(u, full)
+                    _, content_bytes = download(url_full)
+                    if not content_bytes: return m.group(0)
+                    ct = ''
+                    try:
+                        r_head = session.head(url_full, timeout=5)
+                        ct = r_head.headers.get('content-type', '')
+                    except: pass
+                    # Fonts -> inline as data URI (file:// blocks font loading)
+                    if any(x in (ct + u).lower() for x in ['font', 'woff', 'woff2', 'ttf', 'otf', 'eot']):
+                        return f'url({to_data_uri(content_bytes, ct or "font/woff2")})'
+                    # Small images (< 20KB) -> inline
+                    if len(content_bytes) < 20000:
+                        return f'url({to_data_uri(content_bytes, ct or "image/png")})'
+                    # Larger images -> save as file
+                    local_img = url_to_local(url_full)
+                    img_path = work_dir / local_img
+                    img_path.parent.mkdir(parents=True, exist_ok=True)
+                    img_path.write_bytes(content_bytes)
+                    return f'url("{local_img}")'
+                css_text = re.sub(r'url\(([^)]+)\)', css_url_replace, css_text)
+
+                # Inline the CSS
+                style_tag = soup.new_tag('style')
+                style_tag.string = css_text
+                link.replace_with(style_tag)
+                total_files += 1
+
+        # ── Inline <style> blocks - process url() ──
         for s in soup.find_all('style'):
-            if s.string: s.string = process_css(s.string, final_url, work_dir)
+            if not s.string: continue
+            def style_url(m):
+                u = m.group(1).strip().strip("'\"")
+                if u.startswith('data:') or u.startswith('#'): return m.group(0)
+                url_full = resolve(u, final_url)
+                _, content_bytes = download(url_full)
+                if not content_bytes: return m.group(0)
+                ct = ''
+                try:
+                    r_head = session.head(url_full, timeout=5)
+                    ct = r_head.headers.get('content-type', '')
+                except: pass
+                if any(x in (ct + u).lower() for x in ['font', 'woff', 'woff2', 'ttf', 'otf', 'eot']):
+                    return f'url({to_data_uri(content_bytes, ct or "font/woff2")})'
+                if len(content_bytes) < 20000:
+                    return f'url({to_data_uri(content_bytes, ct or "image/png")})'
+                local_img = url_to_local(url_full)
+                img_path = work_dir / local_img
+                img_path.parent.mkdir(parents=True, exist_ok=True)
+                img_path.write_bytes(content_bytes)
+                return f'url("{local_img}")'
+            s.string = re.sub(r'url\(([^)]+)\)', style_url, s.string)
 
-        # ── JS ──
+        # ── JS: download and inline as <script> ──
         for script in soup.find_all('script', src=True):
             src = script.get('src')
             if not src: continue
             full = resolve(src, final_url)
-            progress(f'🌐 Mirroring...\n\n📥 JS: {full[:60]}...')
-            local = download(full, work_dir)
-            if local:
-                try:
-                    code = (work_dir / local).read_text(encoding='utf-8', errors='replace')
-                    (work_dir / local).write_text(beautify_js(code), encoding='utf-8')
-                except: pass
-                script['src'] = local
-                total += 1
+            progress(f'🌐 Mirroring...\n\n📥 JS: {full.split("/")[-1][:50]}...')
+            local, content = download(full)
+            if content:
+                # Strip type="module" if present
+                if script.get('type') == 'module':
+                    del script['type']
+                code = content.decode('utf-8', errors='replace')
+                del script['src']
+                script.string = code
+                total_files += 1
 
-        # ── Images ──
+        # ── Images: download and save as files ──
         for img in soup.find_all('img', src=True):
             src = img.get('src')
             if not src or src.startswith('data:'): continue
             full = resolve(src, final_url)
-            progress(f'🌐 Mirroring...\n\n📥 Image: {full[:60]}...')
-            local = download(full, work_dir)
-            if local:
+            progress(f'🌐 Mirroring...\n\n📥 Image: {full.split("/")[-1][:50]}...')
+            local, content = download(full)
+            if local and content:
+                img_path = work_dir / local
+                img_path.parent.mkdir(parents=True, exist_ok=True)
+                img_path.write_bytes(content)
                 img['src'] = local
-                total += 1
+                total_files += 1
             # srcset
             ss = img.get('srcset')
             if ss:
@@ -191,8 +232,14 @@ jobs:
                     if not p: continue
                     t = p.split()
                     u, d = t[0], ' '.join(t[1:])
-                    fn = download(resolve(u, final_url), work_dir)
-                    out.append(f"{fn} {d}".strip() if fn else p)
+                    fn, cnt = download(resolve(u, final_url))
+                    if fn and cnt:
+                        fp = work_dir / fn
+                        fp.parent.mkdir(parents=True, exist_ok=True)
+                        fp.write_bytes(cnt)
+                        out.append(f"{fn} {d}".strip())
+                    else:
+                        out.append(p)
                 img['srcset'] = ', '.join(out)
 
         # ── <source srcset> ──
@@ -205,8 +252,14 @@ jobs:
                 if not p: continue
                 t = p.split()
                 u, d = t[0], ' '.join(t[1:])
-                fn = download(resolve(u, final_url), work_dir)
-                out.append(f"{fn} {d}".strip() if fn else p)
+                fn, cnt = download(resolve(u, final_url))
+                if fn and cnt:
+                    fp = work_dir / fn
+                    fp.parent.mkdir(parents=True, exist_ok=True)
+                    fp.write_bytes(cnt)
+                    out.append(f"{fn} {d}".strip())
+                else:
+                    out.append(p)
             src['srcset'] = ', '.join(out)
 
         # ── Video/Audio ──
@@ -214,16 +267,36 @@ jobs:
             for attr in ['src', 'poster']:
                 val = tag.get(attr)
                 if val and not val.startswith('data:'):
-                    local = download(resolve(val, final_url), work_dir)
-                    if local: tag[attr] = local; total += 1
+                    local, cnt = download(resolve(val, final_url))
+                    if local and cnt:
+                        fp = work_dir / local
+                        fp.parent.mkdir(parents=True, exist_ok=True)
+                        fp.write_bytes(cnt)
+                        tag[attr] = local
+                        total_files += 1
 
         # ── Inline style url() ──
         for tag in soup.find_all(style=True):
             def ri(m):
                 u = m.group(1).strip().strip("'\"")
                 if u.startswith('data:') or u.startswith('#'): return m.group(0)
-                loc = download(resolve(u, final_url), work_dir)
-                return f'url("{loc}")' if loc else m.group(0)
+                url_full = resolve(u, final_url)
+                _, cnt = download(url_full)
+                if not cnt: return m.group(0)
+                ct = ''
+                try:
+                    r_head = session.head(url_full, timeout=5)
+                    ct = r_head.headers.get('content-type', '')
+                except: pass
+                if any(x in (ct + u).lower() for x in ['font', 'woff', 'woff2', 'ttf', 'otf', 'eot']):
+                    return f'url({to_data_uri(cnt, ct or "font/woff2")})'
+                if len(cnt) < 20000:
+                    return f'url({to_data_uri(cnt, ct or "image/png")})'
+                local_img = url_to_local(url_full)
+                fp = work_dir / local_img
+                fp.parent.mkdir(parents=True, exist_ok=True)
+                fp.write_bytes(cnt)
+                return f'url("{local_img}")'
             tag['style'] = re.sub(r'url\(([^)]+)\)', ri, tag['style'])
 
         # ── Favicons ──
@@ -233,8 +306,12 @@ jobs:
             if any(r in ['icon','shortcut icon','apple-touch-icon','apple-touch-icon-precomposed'] for r in rel):
                 href = link.get('href')
                 if href and not href.startswith('data:'):
-                    local = download(resolve(href, final_url), work_dir)
-                    if local: link['href'] = local
+                    local, cnt = download(resolve(href, final_url))
+                    if local and cnt:
+                        fp = work_dir / local
+                        fp.parent.mkdir(parents=True, exist_ok=True)
+                        fp.write_bytes(cnt)
+                        link['href'] = local
 
         # ── Offline banner ──
         bs = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#1a1a2e;color:#e0e0e0;padding:10px 16px;font-family:system-ui,sans-serif;font-size:13px;text-align:center;border-bottom:2px solid #16213e;'
@@ -242,14 +319,17 @@ jobs:
         b.string = f'📱 Offline mirror: {parsed_page.netloc}{parsed_page.path}'
         if soup.body: soup.body.insert(0, b)
 
+        # Save HTML
         (work_dir / 'index.html').write_text(str(soup), encoding='utf-8')
 
-        progress(f'🌐 Mirroring...\n\n📦 Packaging {total} resources...')
+        progress(f'🌐 Mirroring...\n\n📦 Packaging...')
 
+        # ── Zip ──
         zip_path = Path(work) / 'mirror.zip'
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
             for f in work_dir.rglob('*'):
-                if f.is_file(): zf.write(f, f.relative_to(work_dir))
+                if f.is_file():
+                    zf.write(f, f.relative_to(work_dir))
 
         sz = zip_path.stat().st_size
         if sz < 500:
@@ -274,12 +354,12 @@ jobs:
                 pp.write_bytes(c)
                 api('sendDocument', data={'chat_id': CHAT_ID, 'caption': f'🌐 Mirror: {parsed_page.netloc} ({i+1}/{len(parts)})'}, files={'document': open(pp, 'rb')})
         else:
-            api('sendDocument', data={'chat_id': CHAT_ID, 'caption': f'🌐 Mirror: {parsed_page.netloc}\n📦 {total} resources · {sz // 1024}KB'}, files={'document': open(zip_path, 'rb')})
+            api('sendDocument', data={'chat_id': CHAT_ID, 'caption': f'🌐 Mirror: {parsed_page.netloc}\n📦 {total_files} files · {sz // 1024}KB'}, files={'document': open(zip_path, 'rb')})
 
         if PROGRESS_MSG_ID:
             try: api('deleteMessage', data={'chat_id': CHAT_ID, 'message_id': PROGRESS_MSG_ID})
             except: pass
 
         shutil.rmtree(work, ignore_errors=True)
-        print(f"Done: {total} resources, {sz} bytes")
+        print(f"Done: {total_files} files, {sz} bytes")
         PYEOF
