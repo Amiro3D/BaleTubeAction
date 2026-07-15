@@ -26,6 +26,8 @@ jobs:
         echo "track_name=${TRACK_NAME}" >> $GITHUB_OUTPUT
         echo "chat_id=${CHAT_ID}" >> $GITHUB_OUTPUT
         echo "progress_msg_id=${PROGRESS_MSG_ID}" >> $GITHUB_OUTPUT
+        GROUP_CHAT_ID="${{ github.event.client_payload.group_chat_id || '' }}"
+        echo "group_chat_id=${GROUP_CHAT_ID}" >> $GITHUB_OUTPUT
 
     - name: Checkout (for cookies.txt)
       uses: actions/checkout@v4
@@ -105,6 +107,7 @@ jobs:
         CHAT_ID: ${{ steps.inputs.outputs.chat_id }}
         TRACK_NAME: ${{ steps.inputs.outputs.track_name }}
         FILE: ${{ steps.download.outputs.file }}
+        GROUP_CHAT_ID: ${{ steps.inputs.outputs.group_chat_id }}
       run: |
         cd /tmp/spotify_dl
         API_URL="https://tapi.bale.ai/bot${BALE_BOT_TOKEN}"
@@ -119,6 +122,16 @@ jobs:
         if [ -z "$MSG_ID" ] || [ "$MSG_ID" = "0" ]; then
           echo "ERROR: Failed to send audio. Response: $RESP"
           exit 1
+        fi
+
+        # Forward to group
+        if [ -n "$GROUP_CHAT_ID" ] && [ "$GROUP_CHAT_ID" != "null" ]; then
+          if [ -n "$MSG_ID" ] && [ "$MSG_ID" != "null" ]; then
+            curl -s -X POST "${API}/forwardMessage" \
+              -d chat_id="$GROUP_CHAT_ID" \
+              -d from_chat_id="$CHAT_ID" \
+              -d message_id="$MSG_ID" || true
+          fi
         fi
 
         rm -rf /tmp/spotify_dl

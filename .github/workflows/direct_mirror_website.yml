@@ -18,6 +18,7 @@ jobs:
         TARGET_URL: ${{ github.event.client_payload.url }}
         CHAT_ID: ${{ github.event.client_payload.chat_id }}
         PROGRESS_MSG_ID: ${{ github.event.client_payload.msg_id || '' }}
+        GROUP_CHAT_ID: ${{ github.event.client_payload.group_chat_id || '' }}
       run: |
         set -e
         python3 - "$TARGET_URL" "$CHAT_ID" "$PROGRESS_MSG_ID" "$BALE_BOT_TOKEN" << 'PYEOF'
@@ -32,6 +33,7 @@ jobs:
         CHAT_ID = sys.argv[2]
         PROGRESS_MSG_ID = sys.argv[3]
         BOT_TOKEN = sys.argv[4]
+        GROUP_CHAT_ID = os.environ.get('GROUP_CHAT_ID', '')
         API = f"https://tapi.bale.ai/bot{BOT_TOKEN}"
         TIMEOUT = 15
 
@@ -353,8 +355,22 @@ jobs:
                 pp = Path(work) / f'mirror_part{i+1}.zip'
                 pp.write_bytes(c)
                 api('sendDocument', data={'chat_id': CHAT_ID, 'caption': f'🌐 Mirror: {parsed_page.netloc} ({i+1}/{len(parts)})'}, files={'document': open(pp, 'rb')})
+                # Forward to group
+                if GROUP_CHAT_ID and GROUP_CHAT_ID not in ('', 'null', '0'):
+                    try:
+                        api('sendDocument',
+                            data={'chat_id': GROUP_CHAT_ID, 'caption': f'🌐 Mirror: {parsed_page.netloc} ({i+1}/{len(parts)})'},
+                            files={'document': open(pp, 'rb')})
+                    except: pass
         else:
             api('sendDocument', data={'chat_id': CHAT_ID, 'caption': f'🌐 Mirror: {parsed_page.netloc}\n📦 {total_files} files · {sz // 1024}KB'}, files={'document': open(zip_path, 'rb')})
+            # Forward to group
+            if GROUP_CHAT_ID and GROUP_CHAT_ID not in ('', 'null', '0'):
+                try:
+                    api('sendDocument',
+                        data={'chat_id': GROUP_CHAT_ID, 'caption': f'🌐 Mirror: {parsed_page.netloc}\n📦 {total_files} resources · {sz // 1024}KB'},
+                        files={'document': open(zip_path, 'rb')})
+                except: pass
 
         if PROGRESS_MSG_ID:
             try: api('deleteMessage', data={'chat_id': CHAT_ID, 'message_id': PROGRESS_MSG_ID})

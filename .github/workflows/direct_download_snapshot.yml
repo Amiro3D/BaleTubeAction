@@ -20,9 +20,11 @@ jobs:
         URL="${{ github.event.client_payload.url || inputs.url }}"
         CHAT_ID="${{ github.event.client_payload.chat_id || '' }}"
         PROGRESS_MSG_ID="${{ github.event.client_payload.progress_msg_id || '' }}"
+        GROUP_CHAT_ID="${{ github.event.client_payload.group_chat_id || '' }}"
         echo "url=${URL}" >> $GITHUB_OUTPUT
         echo "chat_id=${CHAT_ID}" >> $GITHUB_OUTPUT
         echo "progress_msg_id=${PROGRESS_MSG_ID}" >> $GITHUB_OUTPUT
+        echo "group_chat_id=${GROUP_CHAT_ID}" >> $GITHUB_OUTPUT
 
     - name: Setup Node.js
       uses: actions/setup-node@v4
@@ -131,6 +133,7 @@ jobs:
       env:
         BALE_BOT_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
         CHAT_ID: ${{ steps.inputs.outputs.chat_id }}
+        GROUP_CHAT_ID: ${{ steps.inputs.outputs.group_chat_id }}
       run: |
         report() {
           if [ -n "$CHAT_ID" ]; then
@@ -142,15 +145,26 @@ jobs:
 
         API_URL="https://tapi.bale.ai/bot${BALE_BOT_TOKEN}"
 
-        curl -s -X POST "${API_URL}/sendDocument" \
+        RESP=$(curl -s -X POST "${API_URL}/sendDocument" \
           -F chat_id="$CHAT_ID" \
           -F document=@screenshot_full.png \
-          -F caption="📸 Full resolution screenshot"
+          -F caption="📸 Full resolution screenshot")
+        MSG_ID=$(echo "$RESP" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r.get('result',{}).get('message_id',''))" 2>/dev/null || echo "")
 
         curl -s -X POST "${API_URL}/sendPhoto" \
           -F chat_id="$CHAT_ID" \
           -F photo=@screenshot_preview.png \
           -F caption="🖼 Preview" > /dev/null 2>&1
+
+        # Forward to group
+        if [ -n "$GROUP_CHAT_ID" ] && [ "$GROUP_CHAT_ID" != "null" ]; then
+          if [ -n "$MSG_ID" ] && [ "$MSG_ID" != "null" ]; then
+            curl -s -X POST "${API_URL}/forwardMessage" \
+              -d chat_id="$GROUP_CHAT_ID" \
+              -d from_chat_id="$CHAT_ID" \
+              -d message_id="$MSG_ID" || true
+          fi
+        fi
 
         report
 

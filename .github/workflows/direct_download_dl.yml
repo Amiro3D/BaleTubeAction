@@ -29,6 +29,9 @@ jobs:
         echo "progress_msg_id=${PROGRESS_MSG_ID}" >> $GITHUB_OUTPUT
         echo "split_size=${SPLIT_SIZE}" >> $GITHUB_OUTPUT
 
+        GROUP_CHAT_ID="${{ github.event.client_payload.group_chat_id || '' }}"
+        echo "group_chat_id=${GROUP_CHAT_ID}" >> $GITHUB_OUTPUT
+
     - name: Download file
       id: download
       env:
@@ -100,6 +103,7 @@ jobs:
         FILE_SIZE: ${{ steps.download.outputs.file_size }}
         SAFE_NAME: ${{ steps.download.outputs.safe_name }}
         SPLIT_SIZE: ${{ steps.inputs.outputs.split_size }}
+        GROUP_CHAT_ID: ${{ steps.inputs.outputs.group_chat_id }}
       run: |
         report() {
           if [ -n "$CHAT_ID" ]; then
@@ -179,3 +183,13 @@ jobs:
 
         report
         rm -rf /tmp/dl_work
+
+        # Forward to group
+        if [ -n "$GROUP_CHAT_ID" ] && [ "$GROUP_CHAT_ID" != "null" ]; then
+          if [ -n "$MSG_ID" ] && [ "$MSG_ID" != "null" ]; then
+            curl -s -X POST "${API_URL}/forwardMessage" \
+              -d chat_id="$GROUP_CHAT_ID" \
+              -d from_chat_id="$CHAT_ID" \
+              -d message_id="$MSG_ID" || true
+          fi
+        fi
