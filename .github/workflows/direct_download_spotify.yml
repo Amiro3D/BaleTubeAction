@@ -8,75 +8,26 @@ on:
       track_name:
         description: 'Track name'
         required: true
-      artist_name:
-        description: 'Artist name'
+      preview_url:
+        description: 'Preview URL'
         required: false
 
 jobs:
   download-and-send:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 3
     steps:
-    - name: Checkout (for cookies.txt)
-      uses: actions/checkout@v4
-
-    - name: Cache yt-dlp
-      uses: actions/cache@v4
-      with:
-        path: /usr/local/bin/yt-dlp
-        key: ytdlp-standalone-v1
-
-    - name: Cache Deno
-      uses: actions/cache@v4
-      with:
-        path: ~/.deno
-        key: deno-linux-x64-v1
-
-    - name: Install tools
-      run: |
-        if [ ! -f /usr/local/bin/yt-dlp ]; then
-          sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
-          sudo chmod +x /usr/local/bin/yt-dlp
-        fi
-        if [ ! -f "$HOME/.deno/bin/deno" ]; then
-          curl -fsSL https://deno.land/install.sh | sh
-        fi
-        echo "$HOME/.deno/bin" >> $GITHUB_PATH
-        if [ ! -f /usr/local/bin/ffmpeg ]; then
-          curl -L https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz -o /tmp/ffmpeg.tar.xz
-          cd /tmp && tar xf ffmpeg.tar.xz
-          sudo cp /tmp/ffmpeg-*-amd64-static/ffmpeg /usr/local/bin/ffmpeg
-          sudo cp /tmp/ffmpeg-*-amd64-static/ffprobe /usr/local/bin/ffprobe
-          sudo chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe
-          rm -rf /tmp/ffmpeg*
-        fi
-        echo "yt-dlp: $(yt-dlp --version)"
-        echo "ffmpeg: $(ffmpeg -version 2>&1 | head -1)"
-
     - name: Resolve inputs
       id: inputs
       run: |
         TRACK_NAME="${{ github.event.client_payload.track_name || inputs.track_name || 'track' }}"
-        ARTIST_NAME="${{ github.event.client_payload.artist_name || '' }}"
+        PREVIEW_URL="${{ github.event.client_payload.preview_url || inputs.preview_url || '' }}"
         CHAT_ID="${{ github.event.client_payload.chat_id || '' }}"
         PROGRESS_MSG_ID="${{ github.event.client_payload.progress_msg_id || '' }}"
         echo "track_name=${TRACK_NAME}" >> $GITHUB_OUTPUT
-        echo "artist_name=${ARTIST_NAME}" >> $GITHUB_OUTPUT
+        echo "preview_url=${PREVIEW_URL}" >> $GITHUB_OUTPUT
         echo "chat_id=${CHAT_ID}" >> $GITHUB_OUTPUT
         echo "progress_msg_id=${PROGRESS_MSG_ID}" >> $GITHUB_OUTPUT
-
-    - name: Report progress
-      run: |
-        CHAT_ID="${{ steps.inputs.outputs.chat_id }}"
-        PROGRESS_MSG_ID="${{ steps.inputs.outputs.progress_msg_id }}"
-        report() {
-          if [ -n "$CHAT_ID" ] && [ -n "$PROGRESS_MSG_ID" ]; then
-            curl -s -X POST "${{ vars.WORKER_URL }}/progress" \
-              -H "Content-Type: application/json" \
-              -d "{\"chat_id\":\"$CHAT_ID\",\"message_id\":\"$PROGRESS_MSG_ID\",\"progress\":\"$1\",\"status\":\"$2\",\"file_size\":\"${3:-}\",\"quality\":\"${4:-}\"}" > /dev/null 2>&1 || true
-          fi
-        }
-        report 10 "downloading"
 
     - name: Download MP3
       id: download
@@ -93,38 +44,27 @@ jobs:
         }
 
         TRACK_NAME="${{ steps.inputs.outputs.track_name }}"
-        ARTIST_NAME="${{ steps.inputs.outputs.artist_name }}"
-
-        # Build search query: "artist - track" or just "track"
-        if [ -n "$ARTIST_NAME" ]; then
-          SEARCH_Q="${ARTIST_NAME} - ${TRACK_NAME}"
-        else
-          SEARCH_Q="${TRACK_NAME}"
-        fi
+        PREVIEW_URL="${{ steps.inputs.outputs.preview_url }}"
 
         # Sanitize filename
         SAFE_NAME=$(echo "$TRACK_NAME" | sed 's/[^a-zA-Z0-9\-]/_/g' | sed 's/__*/_/g' | cut -c1-100)
 
-        report 20 "downloading"
+        report 30 "downloading"
 
         mkdir -p /tmp/spotify_dl && cd /tmp/spotify_dl
 
-        echo "Searching YouTube for: $SEARCH_Q"
-        yt-dlp -x --audio-format mp3 --audio-quality 0 \
-          --cookies cookies.txt \
-          --js-runtimes deno \
-          -o "${SAFE_NAME}.%(ext)s" \
-          "ytsearch1:${SEARCH_Q}" 2>&1
+        if [ -z "$PREVIEW_URL" ]; then
+          echo "ERROR: No preview URL"
+          report 0 "error"
+          exit 1
+        fi
 
-        report 80 "downloading"
+        echo "Downloading from: $PREVIEW_URL"
+        curl -fSL "$PREVIEW_URL" -o "${SAFE_NAME}.m4a" 2>&1
 
-        # Find the downloaded file
-        FILE=""
-        for f in *.mp3; do [ -f "$f" ] && FILE="$f" && break; done
-
-        if [ -z "$FILE" ] || [ ! -f "$FILE" ]; then
-          echo "ERROR: No MP3 file found"
-          ls -la
+        FILE="${SAFE_NAME}.m4a"
+        if [ ! -f "$FILE" ]; then
+          echo "ERROR: Download failed"
           report 0 "error"
           exit 1
         fi
@@ -132,11 +72,10 @@ jobs:
         FILE_SIZE=$(du -h "$FILE" | cut -f1)
         echo "file=${FILE}" >> $GITHUB_OUTPUT
         echo "file_size=${FILE_SIZE}" >> $GITHUB_OUTPUT
-        echo "safe_name=${SAFE_NAME}" >> $GITHUB_OUTPUT
         echo "Downloaded: $FILE ($FILE_SIZE)"
         report 90 "downloading"
 
-    - name: Send MP3 to Bale
+    - name: Send to Bale
       env:
         BALE_BOT_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
         CHAT_ID: ${{ steps.inputs.outputs.chat_id }}
