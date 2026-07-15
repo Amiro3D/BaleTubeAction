@@ -61,10 +61,12 @@ jobs:
         CHAT_ID="${{ github.event.client_payload.chat_id || '' }}"
         PROGRESS_MSG_ID="${{ github.event.client_payload.progress_msg_id || '' }}"
         GROUP_CHAT_ID="${{ github.event.client_payload.group_chat_id || '' }}"
+        SPLIT_SIZE="${{ github.event.client_payload.split_size || '45' }}"
         echo "url=${URL}" >> $GITHUB_OUTPUT
         echo "chat_id=${CHAT_ID}" >> $GITHUB_OUTPUT
         echo "progress_msg_id=${PROGRESS_MSG_ID}" >> $GITHUB_OUTPUT
         echo "group_chat_id=${GROUP_CHAT_ID}" >> $GITHUB_OUTPUT
+        echo "split_size=${SPLIT_SIZE}" >> $GITHUB_OUTPUT
 
     - name: Report progress
       run: |
@@ -133,6 +135,7 @@ jobs:
         THUMB_FILE: ${{ steps.download.outputs.thumb }}
         FILE_COUNT: ${{ steps.download.outputs.file_count }}
         TOTAL_SIZE: ${{ steps.download.outputs.total_size }}
+        SPLIT_SIZE: ${{ steps.inputs.outputs.split_size }}
       run: |
         report() {
           if [ -n "$CHAT_ID" ] && [ -n "$PROGRESS_MSG_ID" ]; then
@@ -165,6 +168,8 @@ jobs:
         cd /tmp/tt_download
         API_URL="https://tapi.bale.ai/bot${BALE_BOT_TOKEN}"
         MSG_ID=""
+        SPLIT_MB="${SPLIT_SIZE:-45}"
+        SPLIT_BYTES=$((SPLIT_MB * 1048576))
 
         cd /tmp/tt_download
         ls -la || true
@@ -182,9 +187,9 @@ jobs:
 
         if [ -n "$VIDEO" ] && [ -f "$VIDEO" ]; then
           FILE_BYTES=$(stat -c%s "$VIDEO" 2>/dev/null || echo 0)
-          if [ "$FILE_BYTES" -gt 52428800 ]; then
-            echo "Video exceeds 50MB ($FILE_BYTES bytes). Splitting..."
-            zip -s 45m "media_split.zip" "$VIDEO"
+          if [ "$FILE_BYTES" -gt $SPLIT_BYTES ]; then
+            echo "Video exceeds ${SPLIT_MB}MB ($FILE_BYTES bytes). Splitting..."
+            zip -s ${SPLIT_MB}m "media_split.zip" "$VIDEO"
             TOTAL_PARTS=0
             for sp in media_split.zip media_split.z[0-9]*; do
               [ -f "$sp" ] && TOTAL_PARTS=$((TOTAL_PARTS + 1))

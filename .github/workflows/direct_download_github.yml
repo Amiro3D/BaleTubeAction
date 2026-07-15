@@ -21,6 +21,7 @@ jobs:
         CHAT_ID="${{ github.event.client_payload.chat_id || '' }}"
         PROGRESS_MSG_ID="${{ github.event.client_payload.progress_msg_id || '' }}"
         GROUP_CHAT_ID="${{ github.event.client_payload.group_chat_id || '' }}"
+        SPLIT_SIZE="${{ github.event.client_payload.split_size || '45' }}"
 
         IS_ASSET=false
         if echo "$URL" | grep -qE '/releases/download/'; then
@@ -47,6 +48,7 @@ jobs:
         echo "chat_id=${CHAT_ID}" >> $GITHUB_OUTPUT
         echo "progress_msg_id=${PROGRESS_MSG_ID}" >> $GITHUB_OUTPUT
         echo "group_chat_id=${GROUP_CHAT_ID}" >> $GITHUB_OUTPUT
+        echo "split_size=${SPLIT_SIZE}" >> $GITHUB_OUTPUT
 
     - name: Report progress
       run: |
@@ -141,6 +143,7 @@ jobs:
         IS_ASSET: ${{ steps.inputs.outputs.is_asset }}
         TOTAL_SIZE: ${{ steps.download.outputs.total_size }}
         FILE_COUNT: ${{ steps.download.outputs.file_count }}
+        SPLIT_SIZE: ${{ steps.inputs.outputs.split_size }}
       run: |
         report() {
           if [ -n "$CHAT_ID" ] && [ -n "$PROGRESS_MSG_ID" ]; then
@@ -172,6 +175,8 @@ jobs:
         MSG_ID=""
         TOTAL_FILES=$(find . -maxdepth 1 -type f | wc -l)
         SENT=0
+        SPLIT_MB="${SPLIT_SIZE:-45}"
+        SPLIT_BYTES=$((SPLIT_MB * 1048576))
         report 70 "uploading" "$TOTAL_SIZE" "GitHub" || true
 
         for f in *; do
@@ -191,10 +196,10 @@ jobs:
           PROG=$((70 + SENT * 25 / TOTAL_FILES))
           echo "Sending: $f ($SIZE_HR) [$PROG%]"
 
-          # Check individual file against 50MB limit
-          if [ "$FSIZE" -gt 52428800 ]; then
-            echo "File $f exceeds 50MB ($FSIZE bytes). Splitting..."
-            zip -s 45m "media_split.zip" "$f"
+          # Check individual file against configurable split threshold
+          if [ "$FSIZE" -gt $SPLIT_BYTES ]; then
+            echo "File $f exceeds ${SPLIT_MB}MB ($FSIZE bytes). Splitting..."
+            zip -s ${SPLIT_MB}m "media_split.zip" "$f"
             TOTAL_PARTS=0
             for sp in media_split.zip media_split.z[0-9]*; do
               [ -f "$sp" ] && TOTAL_PARTS=$((TOTAL_PARTS + 1))

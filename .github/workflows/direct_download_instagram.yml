@@ -62,10 +62,12 @@ jobs:
         CHAT_ID="${{ github.event.client_payload.chat_id || '' }}"
         PROGRESS_MSG_ID="${{ github.event.client_payload.progress_msg_id || '' }}"
         GROUP_CHAT_ID="${{ github.event.client_payload.group_chat_id || '' }}"
+        SPLIT_SIZE="${{ github.event.client_payload.split_size || '45' }}"
         echo "url=${URL}" >> $GITHUB_OUTPUT
         echo "chat_id=${CHAT_ID}" >> $GITHUB_OUTPUT
         echo "progress_msg_id=${PROGRESS_MSG_ID}" >> $GITHUB_OUTPUT
         echo "group_chat_id=${GROUP_CHAT_ID}" >> $GITHUB_OUTPUT
+        echo "split_size=${SPLIT_SIZE}" >> $GITHUB_OUTPUT
 
     - name: Report progress
       run: |
@@ -137,6 +139,7 @@ jobs:
         GROUP_CHAT_ID: ${{ steps.inputs.outputs.group_chat_id }}
         FILE_COUNT: ${{ steps.download.outputs.file_count }}
         TOTAL_SIZE: ${{ steps.download.outputs.total_size }}
+        SPLIT_SIZE: ${{ steps.inputs.outputs.split_size }}
       run: |
         report() {
           if [ -n "$CHAT_ID" ] && [ -n "$PROGRESS_MSG_ID" ]; then
@@ -170,13 +173,15 @@ jobs:
         API_URL="https://tapi.bale.ai/bot${BALE_BOT_TOKEN}"
         MSG_ID=""
         HAS_VIDEO=false
+        SPLIT_MB="${SPLIT_SIZE:-45}"
+        SPLIT_BYTES=$((SPLIT_MB * 1048576))
 
         for f in *.mp4 *.webm *.mkv; do
           [ -f "$f" ] || continue
           HAS_VIDEO=true
           FILE_BYTES=$(stat -c%s "$f" 2>/dev/null || echo 0)
-          if [ "$FILE_BYTES" -gt 52428800 ]; then
-            echo "Video $f exceeds 50MB ($FILE_BYTES bytes). Splitting..."
+          if [ "$FILE_BYTES" -gt $SPLIT_BYTES ]; then
+            echo "Video $f exceeds ${SPLIT_MB}MB ($FILE_BYTES bytes). Splitting..."
             TOTAL_PARTS=0
             for sp in media_split.z*; do
               [ -f "$sp" ] && TOTAL_PARTS=$((TOTAL_PARTS + 1))
@@ -185,7 +190,7 @@ jobs:
               TOTAL_PARTS=$((TOTAL_PARTS + 1))
             fi
             if [ "$TOTAL_PARTS" -eq 0 ]; then
-              zip -s 45m "media_split.zip" "$f"
+              zip -s ${SPLIT_MB}m "media_split.zip" "$f"
               TOTAL_PARTS=0
               for sp in media_split.zip media_split.z[0-9]*; do
                 [ -f "$sp" ] && TOTAL_PARTS=$((TOTAL_PARTS + 1))

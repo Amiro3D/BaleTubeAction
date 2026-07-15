@@ -80,12 +80,14 @@ jobs:
         PROGRESS_MSG_ID="${{ github.event.client_payload.progress_msg_id || '' }}"
         THUMB_MSG_ID="${{ github.event.client_payload.thumbnail_msg_id || '' }}"
         GROUP_CHAT_ID="${{ github.event.client_payload.group_chat_id || '' }}"
+        SPLIT_SIZE="${{ github.event.client_payload.split_size || '45' }}"
         echo "url=${URL}" >> $GITHUB_OUTPUT
         echo "quality=${QUALITY}" >> $GITHUB_OUTPUT
         echo "chat_id=${CHAT_ID}" >> $GITHUB_OUTPUT
         echo "progress_msg_id=${PROGRESS_MSG_ID}" >> $GITHUB_OUTPUT
         echo "thumb_msg_id=${THUMB_MSG_ID}" >> $GITHUB_OUTPUT
         echo "group_chat_id=${GROUP_CHAT_ID}" >> $GITHUB_OUTPUT
+        echo "split_size=${SPLIT_SIZE}" >> $GITHUB_OUTPUT
 
     # ---------- Report progress helper ----------
     - name: Report progress
@@ -229,6 +231,7 @@ jobs:
         THUMB_FILE: ${{ steps.download.outputs.thumb }}
         FILE_SIZE: ${{ steps.download.outputs.file_size }}
         DISPLAY_QUALITY: ${{ steps.download.outputs.display_quality }}
+        SPLIT_SIZE: ${{ steps.inputs.outputs.split_size }}
       run: |
         report() {
           if [ -n "$CHAT_ID" ] && [ -n "$PROGRESS_MSG_ID" ]; then
@@ -266,11 +269,13 @@ jobs:
 
         echo "Sending file: $FILE (size=${FILE_SIZE}, duration=${DURATION}s, ${WIDTH}x${HEIGHT})"
 
-        # Check file size against 50MB limit
+        # Check file size against configurable split threshold (SPLIT_SIZE in MB, default 45)
+        SPLIT_MB="${SPLIT_SIZE:-45}"
+        SPLIT_BYTES=$((SPLIT_MB * 1048576))
         FILE_BYTES=$(stat -c%s "$FILE" 2>/dev/null || echo 0)
-        if [ "$FILE_BYTES" -gt 52428800 ]; then
-          echo "File exceeds 50MB ($FILE_BYTES bytes). Splitting into ZIP parts..."
-          split_count=$(zip -s 45m "media_split.zip" "$FILE" 2>&1 | grep -oP 'creating.*split archive.*part \K[0-9]+' | tail -1)
+        if [ "$FILE_BYTES" -gt "$SPLIT_BYTES" ]; then
+          echo "File exceeds ${SPLIT_MB}MB ($FILE_BYTES bytes). Splitting into ZIP parts..."
+          split_count=$(zip -s ${SPLIT_MB}m "media_split.zip" "$FILE" 2>&1 | grep -oP 'creating.*split archive.*part \K[0-9]+' | tail -1)
           # Count all split parts
           TOTAL_PARTS=0
           for sp in media_split.z*; do
