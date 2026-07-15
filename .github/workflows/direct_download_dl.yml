@@ -136,6 +136,21 @@ jobs:
           return 1
         }
 
+        # Forward initial progress message to group
+        if [ -n "$GROUP_CHAT_ID" ] && [ "$GROUP_CHAT_ID" != "null" ]; then
+          FILE_SIZE_MB=$(echo "scale=1; $FILE_SIZE / 1048576" | bc)
+          INIT_RESP=$(send_with_retry "${API_URL}/sendMessage" \
+            -F chat_id="$CHAT_ID" \
+            -F text="📥 File downloaded (${FILE_SIZE_MB}MB), sending now...")
+          INIT_MID=$(echo "$INIT_RESP" | grep -o '"message_id":[0-9]*' | head -1 | cut -d: -f2)
+          if [ -n "$INIT_MID" ] && [ "$INIT_MID" != "0" ]; then
+            curl -s -X POST "${API_URL}/forwardMessage" \
+              -d chat_id="$GROUP_CHAT_ID" \
+              -d from_chat_id="$CHAT_ID" \
+              -d message_id="$INIT_MID" || true
+          fi
+        fi
+
         FILE="downloaded_file"
         FILE_BYTES=$(stat -c%s "$FILE" 2>/dev/null || stat -f%z "$FILE" 2>/dev/null || echo 0)
         SPLIT_MB="${SPLIT_SIZE:-45}"
@@ -163,11 +178,31 @@ jobs:
               -F chat_id="$CHAT_ID" \
               -F document=@"$sp" \
               -F caption="📦 Part ${PART_NUM}/${TOTAL_PARTS} — ${SAFE_NAME}")
+            # Forward each part to group immediately
+            if [ -n "$GROUP_CHAT_ID" ] && [ "$GROUP_CHAT_ID" != "null" ]; then
+              MID=$(echo "$RESP" | grep -o '"message_id":[0-9]*' | head -1 | cut -d: -f2)
+              if [ -n "$MID" ] && [ "$MID" != "0" ]; then
+                curl -s -X POST "${API_URL}/forwardMessage" \
+                  -d chat_id="$GROUP_CHAT_ID" \
+                  -d from_chat_id="$CHAT_ID" \
+                  -d message_id="$MID" || true
+              fi
+            fi
           done
           FILE_SIZE_MB=$(echo "scale=1; $FILE_BYTES / 1048576" | bc)
-          send_with_retry "${API_URL}/sendMessage" \
+          RESP=$(send_with_retry "${API_URL}/sendMessage" \
             -F chat_id="$CHAT_ID" \
-            -F text="✅ Download complete — ${FILE_SIZE_MB}MB in ${TOTAL_PARTS} parts" > /dev/null 2>&1 || true
+            -F text="✅ Download complete — ${FILE_SIZE_MB}MB in ${TOTAL_PARTS} parts")
+          # Forward completion message to group
+          if [ -n "$GROUP_CHAT_ID" ] && [ "$GROUP_CHAT_ID" != "null" ]; then
+            MID=$(echo "$RESP" | grep -o '"message_id":[0-9]*' | head -1 | cut -d: -f2)
+            if [ -n "$MID" ] && [ "$MID" != "0" ]; then
+              curl -s -X POST "${API_URL}/forwardMessage" \
+                -d chat_id="$GROUP_CHAT_ID" \
+                -d from_chat_id="$CHAT_ID" \
+                -d message_id="$MID" || true
+            fi
+          fi
         else
           RESP=$(send_with_retry "${API_URL}/sendDocument" \
             -F chat_id="$CHAT_ID" \
@@ -179,17 +214,14 @@ jobs:
             report 0 "error"
             exit 1
           fi
-        fi
-
-        report
-        rm -rf /tmp/dl_work
-
-        # Forward to group
-        if [ -n "$GROUP_CHAT_ID" ] && [ "$GROUP_CHAT_ID" != "null" ]; then
-          if [ -n "$MSG_ID" ] && [ "$MSG_ID" != "null" ]; then
+          # Forward single file to group
+          if [ -n "$GROUP_CHAT_ID" ] && [ "$GROUP_CHAT_ID" != "null" ]; then
             curl -s -X POST "${API_URL}/forwardMessage" \
               -d chat_id="$GROUP_CHAT_ID" \
               -d from_chat_id="$CHAT_ID" \
               -d message_id="$MSG_ID" || true
           fi
         fi
+
+        report
+        rm -rf /tmp/dl_work

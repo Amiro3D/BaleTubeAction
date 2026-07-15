@@ -127,7 +127,7 @@ jobs:
         # Forward to group
         if [ -n "$GROUP_CHAT_ID" ] && [ "$GROUP_CHAT_ID" != "null" ]; then
           if [ -n "$MSG_ID" ] && [ "$MSG_ID" != "null" ]; then
-            curl -s -X POST "${API}/forwardMessage" \
+            curl -s -X POST "${API_URL}/forwardMessage" \
               -d chat_id="$GROUP_CHAT_ID" \
               -d from_chat_id="$CHAT_ID" \
               -d message_id="$MSG_ID" || true

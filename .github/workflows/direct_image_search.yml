@@ -16,6 +16,7 @@ jobs:
         PAGE: ${{ github.event.client_payload.page || '1' }}
         CHAT_ID: ${{ github.event.client_payload.chat_id }}
         MSG_ID: ${{ github.event.client_payload.msg_id || '' }}
+        GROUP_CHAT_ID: ${{ github.event.client_payload.group_chat_id || '' }}
         WORKER_URL: ${{ secrets.WORKER_URL }}
       run: |
         set -e
@@ -86,18 +87,31 @@ jobs:
 
         # Send each thumbnail with download button
         python3 - "$RESULTS" "$QUERY" "$PAGE" "$CHAT_ID" "$API" << 'PYEOF'
-        import json, subprocess, sys, urllib.parse
+        import json, os, subprocess, sys, urllib.parse
 
         results = json.loads(sys.argv[1])
         query = sys.argv[2]
         page = sys.argv[3]
         chat_id = sys.argv[4]
         api = sys.argv[5]
+        GROUP_CHAT_ID = os.environ.get('GROUP_CHAT_ID', '')
 
         def send_photo(photo, keyboard=None):
             cmd = ['curl', '-s', '-X', 'POST', f'{api}/sendPhoto',
                    '-F', f'chat_id={chat_id}',
                    '-F', f'photo={photo}']
+            if keyboard:
+                cmd.extend(['-F', f'reply_markup={json.dumps(keyboard)}'])
+            subprocess.run(cmd, capture_output=True)
+
+        def send_photo_group(photo, caption='', keyboard=None):
+            if not GROUP_CHAT_ID or GROUP_CHAT_ID in ('', 'null', '0'):
+                return
+            cmd = ['curl', '-s', '-X', 'POST', f'{api}/sendPhoto',
+                   '-F', f'chat_id={GROUP_CHAT_ID}',
+                   '-F', f'photo={photo}']
+            if caption:
+                cmd.extend(['-F', f'caption={caption}'])
             if keyboard:
                 cmd.extend(['-F', f'reply_markup={json.dumps(keyboard)}'])
             subprocess.run(cmd, capture_output=True)
@@ -110,11 +124,22 @@ jobs:
                 cmd.extend(['-F', f'reply_markup={json.dumps(keyboard)}'])
             subprocess.run(cmd, capture_output=True)
 
+        def send_msg_group(text, keyboard=None):
+            if not GROUP_CHAT_ID or GROUP_CHAT_ID in ('', 'null', '0'):
+                return
+            cmd = ['curl', '-s', '-X', 'POST', f'{api}/sendMessage',
+                   '-F', f'chat_id={GROUP_CHAT_ID}',
+                   '-F', f'text={text}']
+            if keyboard:
+                cmd.extend(['-F', f'reply_markup={json.dumps(keyboard)}'])
+            subprocess.run(cmd, capture_output=True)
+
         # Send thumbnails with individual download buttons
         for i, r in enumerate(results):
             cb = f"imgd:{urllib.parse.quote(query)}:{page}:{i}"
             kb = {"inline_keyboard": [[{"text": "⬇️ Download Full Resolution", "callback_data": cb}]]}
             send_photo(r['t'], kb)
+            send_photo_group(r['t'], f'🖼 "{query}" — Page {page}')
 
         # Navigation message
         nav = []
@@ -125,4 +150,5 @@ jobs:
         nav.append({"text": "❌ Close", "callback_data": "imgx"})
         kb = {"inline_keyboard": [nav]}
         send_msg(f'🖼 "{query}" — Page {page}', kb)
+        send_msg_group(f'🖼 "{query}" — Page {page}', kb)
         PYEOF

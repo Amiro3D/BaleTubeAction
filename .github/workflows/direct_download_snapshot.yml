@@ -145,24 +145,33 @@ jobs:
 
         API_URL="https://tapi.bale.ai/bot${BALE_BOT_TOKEN}"
 
+        # Send full screenshot (document)
         RESP=$(curl -s -X POST "${API_URL}/sendDocument" \
           -F chat_id="$CHAT_ID" \
           -F document=@screenshot_full.png \
           -F caption="📸 Full resolution screenshot")
         MSG_ID=$(echo "$RESP" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r.get('result',{}).get('message_id',''))" 2>/dev/null || echo "")
 
-        curl -s -X POST "${API_URL}/sendPhoto" \
+        # Send preview photo
+        RESP2=$(curl -s -X POST "${API_URL}/sendPhoto" \
           -F chat_id="$CHAT_ID" \
           -F photo=@screenshot_preview.png \
-          -F caption="🖼 Preview" > /dev/null 2>&1
+          -F caption="🖼 Preview")
+        MSG_ID2=$(echo "$RESP2" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r.get('result',{}).get('message_id',''))" 2>/dev/null || echo "")
 
-        # Forward to group
+        # Forward both to group
         if [ -n "$GROUP_CHAT_ID" ] && [ "$GROUP_CHAT_ID" != "null" ]; then
           if [ -n "$MSG_ID" ] && [ "$MSG_ID" != "null" ]; then
             curl -s -X POST "${API_URL}/forwardMessage" \
               -d chat_id="$GROUP_CHAT_ID" \
               -d from_chat_id="$CHAT_ID" \
               -d message_id="$MSG_ID" || true
+          fi
+          if [ -n "$MSG_ID2" ] && [ "$MSG_ID2" != "null" ]; then
+            curl -s -X POST "${API_URL}/forwardMessage" \
+              -d chat_id="$GROUP_CHAT_ID" \
+              -d from_chat_id="$CHAT_ID" \
+              -d message_id="$MSG_ID2" || true
           fi
         fi
 

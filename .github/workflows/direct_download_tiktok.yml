@@ -207,6 +207,15 @@ jobs:
                 -F caption="📦 Part ${PART_NUM}/${TOTAL_PARTS} — TikTok")
               MID=$(echo "$RESP" | grep -o '"message_id":[0-9]*' | head -1 | cut -d: -f2)
               if [ -n "$MID" ] && [ "$MID" != "0" ]; then MSG_ID="$MID"; fi
+              # Forward each part to group
+              if [ -n "$GROUP_CHAT_ID" ] && [ "$GROUP_CHAT_ID" != "null" ]; then
+                if [ -n "$MID" ] && [ "$MID" != "0" ]; then
+                  curl -s -X POST "https://tapi.bale.ai/bot${BALE_BOT_TOKEN}/forwardMessage" \
+                    -d chat_id="$GROUP_CHAT_ID" \
+                    -d from_chat_id="$CHAT_ID" \
+                    -d message_id="$MID" || true
+                fi
+              fi
             done
             FILE_SIZE_MB=$(echo "scale=1; $FILE_BYTES / 1048576" | bc)
             send_with_retry "${API_URL}/sendMessage" \
@@ -230,9 +239,10 @@ jobs:
           exit 1
         fi
         report 100 "done" "$TOTAL_SIZE" "TikTok" || true
+        # Forward progress message to group
         if [ -n "$GROUP_CHAT_ID" ] && [ "$GROUP_CHAT_ID" != "null" ]; then
-          curl -s -X POST "https://tapi.bale.ai/bot${BALE_BOT_TOKEN}/forwardMessage" -d chat_id="$GROUP_CHAT_ID" -d from_chat_id="$CHAT_ID" -d message_id="$PROGRESS_MSG_ID" || true
-          if [ -n "$MSG_ID" ] && [ "$MSG_ID" != "null" ]; then
-            curl -s -X POST "https://tapi.bale.ai/bot${BALE_BOT_TOKEN}/forwardMessage" -d chat_id="$GROUP_CHAT_ID" -d from_chat_id="$CHAT_ID" -d message_id="$MSG_ID" || true
-          fi
+          curl -s -X POST "https://tapi.bale.ai/bot${BALE_BOT_TOKEN}/forwardMessage" \
+            -d chat_id="$GROUP_CHAT_ID" \
+            -d from_chat_id="$CHAT_ID" \
+            -d message_id="$PROGRESS_MSG_ID" || true
         fi
