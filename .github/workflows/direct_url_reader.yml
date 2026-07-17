@@ -163,6 +163,13 @@ jobs:
               if (h1 && isVisible(h1)) title = strip(h1.innerText || '');
             }
 
+            // Extract meta tag content (og:description, description) as fallback for SPAs
+            const metaDesc = document.querySelector('meta[property="og:description"]')
+                          || document.querySelector('meta[name="description"]');
+            const metaDescText = metaDesc ? strip(metaDesc.getAttribute('content') || '') : '';
+            const metaImage = document.querySelector('meta[property="og:image"]');
+            const metaImageUrl = metaImage ? metaImage.getAttribute('content') || '' : '';
+
             // Walk DOM node tree, preserving hyperlinks as HTML <a> tags
             const nodeToText = (node) => {
               if (node.nodeType === 3) return strip(node.textContent || '');
@@ -272,6 +279,11 @@ jobs:
                 const cleanFull = deduped.join('\n\n');
                 if (cleanFull.length > text.length) text = cleanFull;
               }
+
+              // Ultra last resort: use meta description for SPAs that block headless JS
+              if (text.length < 100 && metaDescText) {
+                text = metaDescText;
+              }
             }
 
             // Collect links
@@ -319,6 +331,10 @@ jobs:
               images.push(src);
               if (images.length >= 10) return;
             });
+            // Fallback: use og:image if no page images found
+            if (images.length === 0 && metaImageUrl) {
+              images.push(metaImageUrl);
+            }
 
             return { title, text: text.slice(0, 4000), links, images, url: finalUrl, domain, isChallengePage };
           }, url);
