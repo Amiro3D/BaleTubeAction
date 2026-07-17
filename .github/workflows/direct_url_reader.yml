@@ -233,16 +233,40 @@ jobs:
             // Fallback: take body text trimmed to reasonable size
             let text = collected.join('\n\n');
             if (text.length < 200) {
-              const main = document.querySelector('main') || document.body;
-              const full = nodeToText(main || document.body);
-              // Filter noise lines from fallback text
-              const cleanLines = full.split('\n').filter(line => {
-                const l = line.trim();
-                if (l.length < 20) return false;
-                return !noisePatterns.some(p => p.test(l));
+              // Aggressive fallback: scan ALL visible divs/sections for text
+              const containers = document.querySelectorAll('div, section, article, main, [role="main"], [role="article"]');
+              const fallbackTexts = [];
+              containers.forEach((el) => {
+                if (!isVisible(el)) return;
+                // Only use leaf-ish containers (no nested large containers)
+                if (el.querySelectorAll('div, section').length > 3) return;
+                const t = nodeToText(el);
+                if (t && t.length > 50 && !fallbackTexts.some(f => f.includes(t) || t.includes(f))) {
+                  fallbackTexts.push(t);
+                }
               });
-              const cleanFull = cleanLines.join('\n');
-              if (cleanFull.length > text.length) text = cleanFull;
+              if (fallbackTexts.length) {
+                const combined = fallbackTexts.join('\n\n');
+                // Filter noise lines
+                const cleanLines = combined.split('\n').filter(line => {
+                  const l = line.trim();
+                  if (l.length < 20) return false;
+                  return !noisePatterns.some(p => p.test(l));
+                });
+                const cleanFull = cleanLines.join('\n');
+                if (cleanFull.length > text.length) text = cleanFull;
+              }
+              // Last resort: full body innerText
+              if (text.length < 200) {
+                const full = nodeToText(document.body);
+                const cleanLines = full.split('\n').filter(line => {
+                  const l = line.trim();
+                  if (l.length < 20) return false;
+                  return !noisePatterns.some(p => p.test(l));
+                });
+                const cleanFull = cleanLines.join('\n');
+                if (cleanFull.length > text.length) text = cleanFull;
+              }
             }
 
             // Collect links
