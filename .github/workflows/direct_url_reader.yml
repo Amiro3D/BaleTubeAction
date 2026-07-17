@@ -407,8 +407,10 @@ jobs:
                     return body.trim();
                   });
                   console.log('Wayback text length:', wbText.length);
-                  if (wbText.length > payload.text.length + 100) {
-                    const noisePatterns = [/made possible with ads/i, /please consider/i, /adblock/i, /cookie/i, /privacy policy/i, /loading\.\.\./i, /wayback/i, /web archive/i];
+                  // Skip if it's a Wayback "no archive" search page
+                  const isWaybackNoArchive = /search for all archived pages/i.test(wbText) || /Donate to the archive/i.test(wbText) || /other projects include/i.test(wbText);
+                  if (!isWaybackNoArchive && wbText.length > payload.text.length + 100) {
+                    const noisePatterns = [/made possible with ads/i, /please consider/i, /adblock/i, /cookie/i, /privacy policy/i, /loading\.\.\./i];
                     const cleanLines = wbText.split('\n').map(l => l.trim()).filter(l => l.length > 15 && !noisePatterns.some(p => p.test(l)));
                     const deduped = [];
                     for (const line of cleanLines) {
@@ -417,6 +419,8 @@ jobs:
                     }
                     payload.text = deduped.join('\n\n').slice(0, 4000);
                     console.log('Wayback succeeded, text now:', payload.text.length);
+                  } else {
+                    console.log('Wayback: no archive found or no improvement, skipping');
                   }
                 } catch(e) { console.log('Wayback failed:', e.message); }
                 await wbBrowser.close();
