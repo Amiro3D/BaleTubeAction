@@ -270,7 +270,28 @@ jobs:
             let domain = '';
             try { domain = new URL(finalUrl).hostname; } catch (e) {}
 
-            return { title, text: text.slice(0, 4000), links, url: finalUrl, domain, isChallengePage };
+            // Extract images from the page (skip icons, ads, tiny images)
+            const images = [];
+            const imgSeen = new Set();
+            const imgEls = document.querySelectorAll('img[src]');
+            imgEls.forEach((img) => {
+              if (!isVisible(img)) return;
+              let src = img.getAttribute('src') || '';
+              if (!src || src.startsWith('data:')) return;
+              try { src = new URL(src, window.location.href).href; } catch(e) { return; }
+              // Skip tiny images (icons, tracking pixels)
+              const w = img.naturalWidth || img.width || 0;
+              const h = img.naturalHeight || img.height || 0;
+              if (w > 0 && h > 0 && (w < 100 || h < 100)) return;
+              // Skip common ad/tracking patterns
+              if (/ad[s]?\//i.test(src) || /pixel/i.test(src) || /track/i.test(src) || /logo/i.test(src)) return;
+              if (imgSeen.has(src)) return;
+              imgSeen.add(src);
+              images.push(src);
+              if (images.length >= 10) return;
+            });
+
+            return { title, text: text.slice(0, 4000), links, images, url: finalUrl, domain, isChallengePage };
           }, url);
 
           await browser.close();
