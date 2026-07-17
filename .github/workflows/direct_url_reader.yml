@@ -58,6 +58,7 @@ jobs:
         }
         report_progress 20 "downloading"
 
+        echo "WORKER_URL=${WORKER_URL}"
         URL="${{ steps.inputs.outputs.url }}"
         CHROME=$(which google-chrome-stable 2>/dev/null || which google-chrome 2>/dev/null || which chromium-browser 2>/dev/null || which chromium 2>/dev/null || echo "")
         echo "Chrome: $CHROME"
@@ -213,9 +214,10 @@ jobs:
         if [ ! -f "result.json" ]; then
           echo "ERROR: extract failed"
           # Tell the worker we couldn't extract anything
-          curl -s -X POST "${WORKER_URL}/url-result" \
+          RESP=$(curl -s -w "\n%{http_code}" -X POST "${WORKER_URL}/url-result" \
             -H "Content-Type: application/json" \
-            -d "{\"chat_id\":\"$CHAT_ID\",\"progress_msg_id\":\"$PROGRESS_MSG_ID\",\"url\":\"$URL\",\"title\":\"\",\"text\":\"\",\"links\":[],\"domain\":\"\"}" > /dev/null 2>&1 || true
+            -d "{\"chat_id\":\"$CHAT_ID\",\"progress_msg_id\":\"$PROGRESS_MSG_ID\",\"url\":\"$URL\",\"title\":\"\",\"text\":\"\",\"links\":[],\"domain\":\"\"}" 2>&1)
+          echo "Fallback response: $(echo "$RESP" | tail -1)"
           exit 1
         fi
 
@@ -237,9 +239,17 @@ jobs:
         d['progress_msg_id'] = '$PROGRESS_MSG_ID'
         print(json.dumps(d))
         " 2>/dev/null || echo "{}")
+        echo "WORKER_URL=${WORKER_URL}"
         echo "Posting result to worker..."
-        curl -s -X POST "${WORKER_URL}/url-result" \
+        RESP=$(curl -s -w "\n%{http_code}" -X POST "${WORKER_URL}/url-result" \
           -H "Content-Type: application/json" \
-          -d "$MERGED" > /dev/null 2>&1 || true
+          -d "$MERGED" 2>&1)
+        HTTP_CODE=$(echo "$RESP" | tail -1)
+        BODY=$(echo "$RESP" | head -n -1)
+        echo "Worker response: HTTP ${HTTP_CODE} body=${BODY}"
+        if [ "$HTTP_CODE" != "200" ]; then
+          echo "ERROR: Worker returned HTTP ${HTTP_CODE}"
+          exit 1
+        fi
 
         rm -f extract.js result.json
