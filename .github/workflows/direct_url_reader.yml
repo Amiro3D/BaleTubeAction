@@ -364,7 +364,9 @@ jobs:
                   return body.trim();
                 });
                 console.log('Google Cache text length:', cacheText.length);
-                if (cacheText.length > payload.text.length + 100) {
+                // Skip if it's a Google captcha page
+                const isGoogleCaptcha = /unusual traffic/i.test(cacheText) || /not a robot/i.test(cacheText) || /Why did this happen/i.test(cacheText);
+                if (!isGoogleCaptcha && cacheText.length > payload.text.length + 100) {
                   // Filter noise
                   const noisePatterns = [/made possible with ads/i, /please consider/i, /adblock/i, /cookie/i, /privacy policy/i, /loading\.\.\./i];
                   const cleanLines = cacheText.split('\n').map(l => l.trim()).filter(l => l.length > 15 && !noisePatterns.some(p => p.test(l)));
@@ -375,6 +377,8 @@ jobs:
                   }
                   payload.text = deduped.join('\n\n').slice(0, 4000);
                   console.log('Google Cache succeeded, text now:', payload.text.length);
+                } else {
+                  console.log('Google Cache: captcha detected or no improvement, skipping');
                 }
               } catch(e) { console.log('Google Cache failed:', e.message); }
               await cacheBrowser.close();
