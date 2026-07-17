@@ -163,6 +163,28 @@ jobs:
               if (h1 && isVisible(h1)) title = strip(h1.innerText || '');
             }
 
+            // Walk DOM node tree, preserving hyperlinks as HTML <a> tags
+            const nodeToText = (node) => {
+              if (node.nodeType === 3) return strip(node.textContent || '');
+              if (node.nodeType !== 1) return '';
+              const tag = node.tagName.toLowerCase();
+              if (tag === 'script' || tag === 'style' || tag === 'noscript') return '';
+              if (!isVisible(node)) return '';
+              // <a> → <a href="url">text</a>
+              if (tag === 'a') {
+                const href = node.getAttribute('href') || '';
+                let abs = href;
+                try { abs = new URL(href, window.location.href).href; } catch(e) {}
+                const inner = Array.from(node.childNodes).map(nodeToText).join('');
+                if (inner && abs && !abs.startsWith('javascript:')) return `<a href="${abs}">${inner}</a>`;
+                return inner;
+              }
+              // Block elements get double newline after
+              const isBlock = ['p','div','section','article','li','h1','h2','h3','h4','h5','h6','blockquote','tr'].includes(tag);
+              const children = Array.from(node.childNodes).map(nodeToText).join('');
+              return isBlock ? children + '\n' : children;
+            };
+
             // Collect text from paragraphs, headings, list items, and visible large spans
             const collected = [];
             const seenText = new Set();
@@ -178,19 +200,19 @@ jobs:
               const els = document.querySelectorAll(sel);
               els.forEach((el) => {
                 if (!isVisible(el)) return;
-                // Only take text directly from leaf-ish elements to avoid huge duplicate blocks
-                const directText = strip(el.innerText || '');
+                // Use nodeToText to preserve hyperlinks as [text](url)
+                const directText = nodeToText(el);
                 if (directText && directText.length <= 600) push(directText);
                 else if (directText) push(directText.slice(0, 600));
               });
               if (collected.join('\n').length > 4000) break;
             }
 
-            // Fallback: take body innerText trimmed to reasonable size
+            // Fallback: take body text trimmed to reasonable size
             let text = collected.join('\n\n');
             if (text.length < 200) {
               const main = document.querySelector('main') || document.body;
-              const full = strip(main && main.innerText ? main.innerText : (document.body && document.body.innerText) || '');
+              const full = nodeToText(main || document.body);
               if (full.length > text.length) text = full;
             }
 
