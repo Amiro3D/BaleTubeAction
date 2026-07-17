@@ -1,0 +1,245 @@
+name: URL Content Reader
+
+on:
+  repository_dispatch:
+    types: [bale_url_read]
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Webpage URL'
+        required: true
+
+jobs:
+  read:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+    - name: Resolve inputs
+      id: inputs
+      run: |
+        URL="${{ github.event.client_payload.url || inputs.url }}"
+        CHAT_ID="${{ github.event.client_payload.chat_id || '' }}"
+        PROGRESS_MSG_ID="${{ github.event.client_payload.progress_msg_id || '' }}"
+        GROUP_CHAT_ID="${{ github.event.client_payload.group_chat_id || '' }}"
+        echo "url=${URL}" >> $GITHUB_OUTPUT
+        echo "chat_id=${CHAT_ID}" >> $GITHUB_OUTPUT
+        echo "progress_msg_id=${PROGRESS_MSG_ID}" >> $GITHUB_OUTPUT
+        echo "group_chat_id=${GROUP_CHAT_ID}" >> $GITHUB_OUTPUT
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Cache puppeteer-core
+      id: puppeteer-cache
+      uses: actions/cache@v4
+      with:
+        path: node_modules
+        key: puppeteer-core-${{ runner.os }}
+
+    - name: Install puppeteer-core
+      if: steps.puppeteer-cache.outputs.cache-hit != 'true'
+      run: npm install puppeteer-core
+
+    - name: Extract page content
+      id: extract
+      env:
+        CHAT_ID: ${{ steps.inputs.outputs.chat_id }}
+        PROGRESS_MSG_ID: ${{ steps.inputs.outputs.progress_msg_id }}
+        WORKER_URL: ${{ vars.WORKER_URL }}
+      run: |
+        report_progress() {
+          if [ -n "$CHAT_ID" ] && [ -n "$PROGRESS_MSG_ID" ]; then
+            curl -s -X POST "${WORKER_URL}/progress" \
+              -H "Content-Type: application/json" \
+              -d "{\"chat_id\":\"$CHAT_ID\",\"message_id\":\"$PROGRESS_MSG_ID\",\"progress\":\"$1\",\"status\":\"$2\"}" > /dev/null 2>&1 || true
+          fi
+        }
+        report_progress 20 "downloading"
+
+        URL="${{ steps.inputs.outputs.url }}"
+        CHROME=$(which google-chrome-stable 2>/dev/null || which google-chrome 2>/dev/null || which chromium-browser 2>/dev/null || which chromium 2>/dev/null || echo "")
+        echo "Chrome: $CHROME"
+
+        cat > extract.js << 'SCRIPT'
+        const puppeteer = require('puppeteer-core');
+        (async () => {
+          const url = process.argv[2];
+          const chromePath = process.argv[3];
+          const outPath = process.argv[4];
+          const browser = await puppeteer.launch({
+            executablePath: chromePath,
+            headless: 'new',
+            args: [
+              '--no-sandbox',
+              '--disable-setuid-sandbox',
+              '--disable-dev-shm-usage',
+              '--disable-gpu',
+              '--window-size=1920,1080'
+            ]
+          });
+          const page = await browser.newPage();
+          await page.setViewport({ width: 1920, height: 1080 });
+          await page.setExtraHTTPHeaders({
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
+          });
+          await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
+
+          let loaded = false;
+          for (let attempt = 0; attempt < 3 && !loaded; attempt++) {
+            try {
+              await page.goto(url, { waitUntil: 'networkidle2', timeout: 20000 });
+              loaded = true;
+            } catch (e) {
+              console.error('Attempt ' + (attempt + 1) + ' (networkidle2): ' + e.message);
+              try {
+                await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+                loaded = true;
+              } catch (e2) {
+                console.error('Attempt ' + (attempt + 1) + ' (domcontentloaded): ' + e2.message);
+              }
+            }
+          }
+          if (!loaded) { await browser.close(); process.exit(1); }
+
+          // Let late-hydration scripts finish
+          await new Promise(r => setTimeout(r, 1500));
+
+          // Friendly scroll to trigger lazy-loaded content
+          try {
+            await page.evaluate(async () => {
+              await new Promise(resolve => {
+                let total = 0; const step = 600;
+                const t = setInterval(() => {
+                  window.scrollBy(0, step); total += step;
+                  if (total >= document.body.scrollHeight + 200) { clearInterval(t); resolve(); }
+                }, 80);
+              });
+            });
+            await new Promise(r => setTimeout(r, 600));
+          } catch (e) {}
+
+          const payload = await page.evaluate((pageUrl) => {
+            const strip = (s) => (s || '').replace(/\s+/g, ' ').trim();
+            const isVisible = (el) => {
+              if (!el || !el.getClientRects) return false;
+              const rects = el.getClientRects();
+              if (!rects.length) return false;
+              const rect = rects[0];
+              if (rect.width === 0 || rect.height === 0) return false;
+              const style = window.getComputedStyle(el);
+              if (style.display === 'none' || style.visibility === 'hidden') return false;
+              if (parseFloat(style.opacity || '1') === 0) return false;
+              return true;
+            };
+
+            let title = strip(document.title || '');
+            if (!title) {
+              const h1 = document.querySelector('h1');
+              if (h1 && isVisible(h1)) title = strip(h1.innerText || '');
+            }
+
+            // Collect text from paragraphs, headings, list items, and visible large spans
+            const collected = [];
+            const seenText = new Set();
+            const push = (txt) => {
+              const clean = strip(txt);
+              if (clean.length < 30) return;
+              if (seenText.has(clean)) return;
+              seenText.add(clean);
+              collected.push(clean);
+            };
+            const selectors = ['p', 'li', 'h2', 'h3', 'h4', 'blockquote', 'section > div', 'article', '[class*="description"]', '[class*="content"]'];
+            for (const sel of selectors) {
+              const els = document.querySelectorAll(sel);
+              els.forEach((el) => {
+                if (!isVisible(el)) return;
+                // Only take text directly from leaf-ish elements to avoid huge duplicate blocks
+                const directText = strip(el.innerText || '');
+                if (directText && directText.length <= 600) push(directText);
+                else if (directText) push(directText.slice(0, 600));
+              });
+              if (collected.join('\n').length > 4000) break;
+            }
+
+            // Fallback: take body innerText trimmed to reasonable size
+            let text = collected.join('\n\n');
+            if (text.length < 200) {
+              const main = document.querySelector('main') || document.body;
+              const full = strip(main && main.innerText ? main.innerText : (document.body && document.body.innerText) || '');
+              if (full.length > text.length) text = full;
+            }
+
+            // Collect links
+            const linkSeen = new Set();
+            const links = [];
+            const anchors = document.querySelectorAll('a[href]');
+            const base = new URL(pageUrl, window.location.href);
+            anchors.forEach((a) => {
+              if (!isVisible(a)) return;
+              let href = a.getAttribute('href') || '';
+              if (!href || href.startsWith('#') || href.startsWith('javascript:')) return;
+              let abs;
+              try { abs = new URL(href, base).href; } catch (e) { return; }
+              if (linkSeen.has(abs)) return;
+              const txt = strip(a.innerText || '');
+              if (txt.length < 2) return;
+              linkSeen.add(abs);
+              links.push({ text: txt.slice(0, 200), url: abs });
+              if (links.length >= 30) return;
+            });
+
+            // Resolve final URL (after redirects) and domain
+            let finalUrl = pageUrl;
+            try { finalUrl = window.location.href; } catch (e) {}
+            let domain = '';
+            try { domain = new URL(finalUrl).hostname; } catch (e) {}
+
+            return { title, text: text.slice(0, 4000), links, url: finalUrl, domain };
+          }, url);
+
+          await browser.close();
+
+          const fs = require('fs');
+          fs.writeFileSync(outPath, JSON.stringify(payload));
+          console.log('Done');
+        })();
+        SCRIPT
+
+        node extract.js "$URL" "$CHROME" "result.json" 2>&1
+
+        if [ ! -f "result.json" ]; then
+          echo "ERROR: extract failed"
+          # Tell the worker we couldn't extract anything
+          curl -s -X POST "${WORKER_URL}/url-result" \
+            -H "Content-Type: application/json" \
+            -d "{\"chat_id\":\"$CHAT_ID\",\"progress_msg_id\":\"$PROGRESS_MSG_ID\",\"url\":\"$URL\",\"title\":\"\",\"text\":\"\",\"links\":[],\"domain\":\"\"}" > /dev/null 2>&1 || true
+          exit 1
+        fi
+
+        report_progress 80 "downloading"
+
+    - name: Post result to worker
+      env:
+        WORKER_URL: ${{ vars.WORKER_URL }}
+        CHAT_ID: ${{ steps.inputs.outputs.chat_id }}
+        PROGRESS_MSG_ID: ${{ steps.inputs.outputs.progress_msg_id }}
+      run: |
+        URL="${{ steps.inputs.outputs.url }}"
+        PAYLOAD=$(cat result.json)
+        # Add chat_id + progress_msg_id into the JSON payload (use python to merge safely)
+        MERGED=$(python3 -c "
+        import sys, json
+        with open('result.json') as f: d = json.load(f)
+        d['chat_id'] = '$CHAT_ID'
+        d['progress_msg_id'] = '$PROGRESS_MSG_ID'
+        print(json.dumps(d))
+        " 2>/dev/null || echo "{}")
+        echo "Posting result to worker..."
+        curl -s -X POST "${WORKER_URL}/url-result" \
+          -H "Content-Type: application/json" \
+          -d "$MERGED" > /dev/null 2>&1 || true
+
+        rm -f extract.js result.json
