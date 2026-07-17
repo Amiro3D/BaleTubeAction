@@ -188,19 +188,41 @@ jobs:
             // Collect text from paragraphs, headings, list items, and visible large spans
             const collected = [];
             const seenText = new Set();
+            // Noise/ad patterns to filter out
+            const noisePatterns = [
+              /made possible with ads/i, /please consider/i, /adblock/i,
+              /cookie/i, /privacy policy/i, /terms of service/i,
+              /sign up/i, /log in/i, /register/i, /subscribe/i,
+              /copyright/i, /all rights reserved/i,
+              /loading\.\.\./i, /skip to/i, /jump to/i,
+              /switch to legacy/i, /contact us/i, /get manager/i,
+              /communities.*developers/i, /developers.*communities/i,
+            ];
             const push = (txt) => {
               const clean = strip(txt);
               if (clean.length < 30) return;
               if (seenText.has(clean)) return;
+              // Skip noise/ad text
+              if (noisePatterns.some(p => p.test(clean))) return;
+              // Skip if this text is just a substring of something already collected
+              for (const existing of seenText) {
+                if (existing.includes(clean) || clean.includes(existing)) return;
+              }
               seenText.add(clean);
               collected.push(clean);
             };
-            const selectors = ['p', 'li', 'h2', 'h3', 'h4', 'blockquote', 'section > div', 'article', '[class*="description"]', '[class*="content"]'];
+            // Prioritize content-specific selectors first, then broader ones
+            const selectors = [
+              'article', 'main', '[role="main"]',
+              'h1', 'h2', 'h3', 'h4',
+              'p', 'li', 'blockquote',
+              '[class*="description"]', '[class*="content"]', '[class*="detail"]',
+            ];
             for (const sel of selectors) {
               const els = document.querySelectorAll(sel);
               els.forEach((el) => {
                 if (!isVisible(el)) return;
-                // Use nodeToText to preserve hyperlinks as [text](url)
+                // Use nodeToText to preserve hyperlinks as <a> tags
                 const directText = nodeToText(el);
                 if (directText && directText.length <= 600) push(directText);
                 else if (directText) push(directText.slice(0, 600));
@@ -213,7 +235,14 @@ jobs:
             if (text.length < 200) {
               const main = document.querySelector('main') || document.body;
               const full = nodeToText(main || document.body);
-              if (full.length > text.length) text = full;
+              // Filter noise lines from fallback text
+              const cleanLines = full.split('\n').filter(line => {
+                const l = line.trim();
+                if (l.length < 20) return false;
+                return !noisePatterns.some(p => p.test(l));
+              });
+              const cleanFull = cleanLines.join('\n');
+              if (cleanFull.length > text.length) text = cleanFull;
             }
 
             // Collect links
