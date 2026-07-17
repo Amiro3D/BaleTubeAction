@@ -341,6 +341,85 @@ jobs:
 
           await browser.close();
 
+          // If text is thin, try Google Cache and Wayback Machine fallbacks
+          if (payload.text.length < 200) {
+            console.log('Text too thin (' + payload.text.length + ' chars), trying fallbacks...');
+
+            // Try Google Cache
+            const cacheUrl = 'https://webcache.googleusercontent.com/search?q=cache:' + encodeURIComponent(url);
+            console.log('Trying Google Cache:', cacheUrl);
+            try {
+              const cacheBrowser = await puppeteer.launch({
+                executablePath: chromePath,
+                headless: 'new',
+                args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
+              });
+              const cachePage = await cacheBrowser.newPage();
+              await cachePage.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
+              try {
+                await cachePage.goto(cacheUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+                await new Promise(r => setTimeout(r, 2000));
+                const cacheText = await cachePage.evaluate(() => {
+                  const body = document.body ? (document.body.innerText || '') : '';
+                  return body.trim();
+                });
+                console.log('Google Cache text length:', cacheText.length);
+                if (cacheText.length > payload.text.length + 100) {
+                  // Filter noise
+                  const noisePatterns = [/made possible with ads/i, /please consider/i, /adblock/i, /cookie/i, /privacy policy/i, /loading\.\.\./i];
+                  const cleanLines = cacheText.split('\n').map(l => l.trim()).filter(l => l.length > 15 && !noisePatterns.some(p => p.test(l)));
+                  const deduped = [];
+                  for (const line of cleanLines) {
+                    if (deduped.some(d => d.includes(line) || line.includes(d))) continue;
+                    deduped.push(line);
+                  }
+                  payload.text = deduped.join('\n\n').slice(0, 4000);
+                  console.log('Google Cache succeeded, text now:', payload.text.length);
+                }
+              } catch(e) { console.log('Google Cache failed:', e.message); }
+              await cacheBrowser.close();
+            } catch(e) { console.log('Google Cache launch failed:', e.message); }
+
+            // Try Wayback Machine if still thin
+            if (payload.text.length < 200) {
+              const waybackUrl = 'https://web.archive.org/web/' + url;
+              console.log('Trying Wayback Machine:', waybackUrl);
+              try {
+                const wbBrowser = await puppeteer.launch({
+                  executablePath: chromePath,
+                  headless: 'new',
+                  args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
+                });
+                const wbPage = await wbBrowser.newPage();
+                await wbPage.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
+                try {
+                  await wbPage.goto(waybackUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+                  await new Promise(r => setTimeout(r, 2000));
+                  const wbText = await wbPage.evaluate(() => {
+                    // Exclude Wayback toolbar
+                    const toolbar = document.getElementById('wm-ipp-base') || document.getElementById('wm-ipp');
+                    if (toolbar) toolbar.remove();
+                    const body = document.body ? (document.body.innerText || '') : '';
+                    return body.trim();
+                  });
+                  console.log('Wayback text length:', wbText.length);
+                  if (wbText.length > payload.text.length + 100) {
+                    const noisePatterns = [/made possible with ads/i, /please consider/i, /adblock/i, /cookie/i, /privacy policy/i, /loading\.\.\./i, /wayback/i, /web archive/i];
+                    const cleanLines = wbText.split('\n').map(l => l.trim()).filter(l => l.length > 15 && !noisePatterns.some(p => p.test(l)));
+                    const deduped = [];
+                    for (const line of cleanLines) {
+                      if (deduped.some(d => d.includes(line) || line.includes(d))) continue;
+                      deduped.push(line);
+                    }
+                    payload.text = deduped.join('\n\n').slice(0, 4000);
+                    console.log('Wayback succeeded, text now:', payload.text.length);
+                  }
+                } catch(e) { console.log('Wayback failed:', e.message); }
+                await wbBrowser.close();
+              } catch(e) { console.log('Wayback launch failed:', e.message); }
+            }
+          }
+
           // Debug: log extraction results
           console.log('Title:', payload.title);
           console.log('Text length:', payload.text.length);
