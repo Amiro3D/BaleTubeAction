@@ -455,59 +455,56 @@ jobs:
 
         report_progress 80 "downloading"
 
-    - name: Send images as media group
-      if: always()
+    - name: Post result to worker
       env:
-        BALE_BOT_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
+        WORKER_URL: ${{ vars.WORKER_URL }}
         CHAT_ID: ${{ steps.inputs.outputs.chat_id }}
+        PROGRESS_MSG_ID: ${{ steps.inputs.outputs.progress_msg_id }}
+        BALE_BOT_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
       run: |
-        # Extract image URLs from result.json and download them
+        URL="${{ steps.inputs.outputs.url }}"
+
+        # Send images as media group BEFORE posting text to worker
         IMG_COUNT=$(python3 -c "
-        import json
-        with open('result.json') as f: d = json.load(f)
-        imgs = d.get('images', [])
-        print(len(imgs))
-        " 2>/dev/null || echo "0")
-        echo "Images to download: $IMG_COUNT"
+import json
+with open('result.json') as f: d = json.load(f)
+print(len(d.get('images', [])))
+" 2>/dev/null || echo "0")
+        echo "Images found: $IMG_COUNT"
 
         if [ "$IMG_COUNT" -gt 0 ] && [ -n "$BALE_BOT_TOKEN" ] && [ -n "$CHAT_ID" ]; then
           API_URL="https://tapi.bale.ai/bot${BALE_BOT_TOKEN}"
           mkdir -p /tmp/url_images
 
-          # Download images
           python3 -c "
-          import json, urllib.request, os
-          with open('result.json') as f: d = json.load(f)
-          for i, url in enumerate(d.get('images', [])[:10]):
-              try:
-                  req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                  data = urllib.request.urlopen(req, timeout=10).read()
-                  ext = 'jpg'
-                  if '.png' in url.lower(): ext = 'png'
-                  elif '.gif' in url.lower(): ext = 'gif'
-                  elif '.webp' in url.lower(): ext = 'webp'
-                  path = f'/tmp/url_images/photo_{i}.{ext}'
-                  with open(path, 'wb') as f: f.write(data)
-                  print(f'Downloaded: {path} ({len(data)} bytes)')
-              except Exception as e:
-                  print(f'Failed: {url} - {e}')
-          " 2>&1
+import json, urllib.request
+with open('result.json') as f: d = json.load(f)
+for i, url in enumerate(d.get('images', [])[:10]):
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        data = urllib.request.urlopen(req, timeout=15).read()
+        ext = 'jpg'
+        if '.png' in url.lower(): ext = 'png'
+        elif '.gif' in url.lower(): ext = 'gif'
+        elif '.webp' in url.lower(): ext = 'webp'
+        path = f'/tmp/url_images/photo_{i}.{ext}'
+        with open(path, 'wb') as f: f.write(data)
+        print(f'OK: {path} ({len(data)} bytes)')
+    except Exception as e:
+        print(f'FAIL: {url} - {e}')
+" 2>&1
 
-          # Count downloaded files
           DOWNLOADED=$(ls /tmp/url_images/photo_* 2>/dev/null | wc -l)
           echo "Downloaded: $DOWNLOADED files"
 
           if [ "$DOWNLOADED" -gt 0 ]; then
-            # Build media group JSON
             MEDIA="["
             for i in $(seq 0 $((DOWNLOADED - 1))); do
               if [ $i -gt 0 ]; then MEDIA="$MEDIA,"; fi
-              FEXT=$(ls /tmp/url_images/photo_${i}.* 2>/dev/null | head -1 | grep -o '\.[^.]*$')
               MEDIA="$MEDIA{\"type\":\"photo\",\"media\":\"attach://p$i\"}"
             done
             MEDIA="$MEDIA]"
 
-            # Build curl args
             CURL_ARGS=(-F "chat_id=$CHAT_ID" -F "media=$MEDIA")
             for i in $(seq 0 $((DOWNLOADED - 1))); do
               FILE=$(ls /tmp/url_images/photo_${i}.* 2>/dev/null | head -1)
@@ -518,28 +515,20 @@ jobs:
 
             echo "Sending $DOWNLOADED images as media group..."
             RESP=$(curl -s -X POST "${API_URL}/sendMediaGroup" "${CURL_ARGS[@]}" 2>&1)
-            echo "Media group response: $(echo "$RESP" | head -c 300)"
+            echo "Response: $(echo "$RESP" | head -c 500)"
           fi
           rm -rf /tmp/url_images
         fi
 
-    - name: Post result to worker
-      env:
-        WORKER_URL: ${{ vars.WORKER_URL }}
-        CHAT_ID: ${{ steps.inputs.outputs.chat_id }}
-        PROGRESS_MSG_ID: ${{ steps.inputs.outputs.progress_msg_id }}
-      run: |
-        URL="${{ steps.inputs.outputs.url }}"
-        PAYLOAD=$(cat result.json)
-        # Add chat_id + progress_msg_id into the JSON payload (use python to merge safely)
+        # Post text + buttons to worker
         MERGED=$(python3 -c "
-        import sys, json
-        with open('result.json') as f: d = json.load(f)
-        d['chat_id'] = '$CHAT_ID'
-        d['progress_msg_id'] = '$PROGRESS_MSG_ID'
-        print(json.dumps(d))
-        " 2>/dev/null || echo "{}")
-        echo "WORKER_URL=${WORKER_URL}"
+import sys, json
+with open('result.json') as f: d = json.load(f)
+d['chat_id'] = '$CHAT_ID'
+d['progress_msg_id'] = '$PROGRESS_MSG_ID'
+d['images'] = []
+print(json.dumps(d))
+" 2>/dev/null || echo "{}")
         echo "Posting result to worker..."
         RESP=$(curl -s -w "\n%{http_code}" -X POST "${WORKER_URL}/url-result" \
           -H "Content-Type: application/json" \
