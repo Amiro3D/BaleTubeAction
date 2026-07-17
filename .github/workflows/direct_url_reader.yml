@@ -256,15 +256,20 @@ jobs:
                 const cleanFull = cleanLines.join('\n');
                 if (cleanFull.length > text.length) text = cleanFull;
               }
-              // Last resort: full body innerText
+              // Last resort: body.innerText (what browser actually renders)
               if (text.length < 200) {
-                const full = nodeToText(document.body);
-                const cleanLines = full.split('\n').filter(line => {
-                  const l = line.trim();
-                  if (l.length < 20) return false;
+                const full = (document.body.innerText || '').trim();
+                const cleanLines = full.split('\n').map(l => l.trim()).filter(l => {
+                  if (l.length < 15) return false;
                   return !noisePatterns.some(p => p.test(l));
                 });
-                const cleanFull = cleanLines.join('\n');
+                // Deduplicate substrings
+                const deduped = [];
+                for (const line of cleanLines) {
+                  if (deduped.some(d => d.includes(line) || line.includes(d))) continue;
+                  deduped.push(line);
+                }
+                const cleanFull = deduped.join('\n\n');
                 if (cleanFull.length > text.length) text = cleanFull;
               }
             }
