@@ -124,6 +124,27 @@ jobs:
 
           const payload = await page.evaluate((pageUrl) => {
             const strip = (s) => (s || '').replace(/\s+/g, ' ').trim();
+            const bodyText = strip(document.body && document.body.innerText || '');
+
+            // Detect captcha / Cloudflare / bot-protection challenge pages
+            const challengePatterns = [
+              /checking your browser/i,
+              /verify you are human/i,
+              /just a moment/i,
+              /attention required/i,
+              /enable javascript and cookies/i,
+              /challenge-platform/i,
+              /cf-browser-verification/i,
+              /robot or human/i,
+              /are you a robot/i,
+              /please wait while we.*redirect/i,
+              /لطفا منتظر بمانید/i,
+              /در حال بررسی مرورگر/i,
+              /هدایت خواهید شد/i,
+            ];
+            const isChallengePage = challengePatterns.some(p => p.test(bodyText)) ||
+              !!document.querySelector('#challenge-running, #challenge-stage, .cf-browser-verification, [id*="challenge"], .g-recaptcha, [class*="captcha"]');
+
             const isVisible = (el) => {
               if (!el || !el.getClientRects) return false;
               const rects = el.getClientRects();
@@ -198,7 +219,7 @@ jobs:
             let domain = '';
             try { domain = new URL(finalUrl).hostname; } catch (e) {}
 
-            return { title, text: text.slice(0, 4000), links, url: finalUrl, domain };
+            return { title, text: text.slice(0, 4000), links, url: finalUrl, domain, isChallengePage };
           }, url);
 
           await browser.close();
