@@ -320,6 +320,13 @@ jobs:
 
           await browser.close();
 
+          // Debug: log extraction results
+          console.log('Title:', payload.title);
+          console.log('Text length:', payload.text.length);
+          console.log('Text preview:', payload.text.slice(0, 300));
+          console.log('Images found:', payload.images.length);
+          console.log('Links found:', payload.links.length);
+
           const fs = require('fs');
           fs.writeFileSync(outPath, JSON.stringify(payload));
           console.log('Done');
