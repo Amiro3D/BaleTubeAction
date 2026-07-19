@@ -100,9 +100,51 @@ jobs:
           curl -s -X POST "$API/deleteMessage" -F "chat_id=$CHAT_ID" -F "message_id=$MSG_ID" > /dev/null 2>&1 || true
         fi
 
+        # send_with_retry: POST to a Bale API method with curl multipart args,
+        # retrying on HTTP 429 (honoring parameters.retry_after) and 5xx up to
+        # MAX_RETRIES times. Returns the last response body.
+        # Usage: send_with_retry <api_url> [curl args ...]
+        send_with_retry() {
+          local API_URL="$1"; shift
+          local MAX_RETRIES=5
+          local RESP ERROR_CODE RETRY_AFTER
+          for i in $(seq 1 $MAX_RETRIES); do
+            RESP=$(curl -s -X POST "$API_URL" "$@")
+            ERROR_CODE=$(printf '%s' "$RESP" | grep -o '"error_code":[0-9]*' | head -1 | cut -d: -f2)
+            if [ "$ERROR_CODE" = "429" ]; then
+              RETRY_AFTER=$(printf '%s' "$RESP" | grep -o '"retry_after":[0-9]*' | head -1 | cut -d: -f2)
+              RETRY_AFTER=${RETRY_AFTER:-5}
+              echo "send_with_retry: 429. Waiting ${RETRY_AFTER}s (attempt $i/$MAX_RETRIES)" >&2
+              sleep $((RETRY_AFTER + 2))
+              continue
+            fi
+            if [ -n "$ERROR_CODE" ] && [ "$ERROR_CODE" -ge 500 ] 2>/dev/null; then
+              echo "send_with_retry: Bale error_code=$ERROR_CODE (attempt $i/$MAX_RETRIES)" >&2
+              sleep $i
+              continue
+            fi
+            printf '%s' "$RESP"
+            return 0
+          done
+          printf '%s' "$RESP"
+        }
+
+        # download_to_temp: fetch a thumb URL to a temp file using a real browser
+        # UA + redirect following, then return the local path. Outputs nothing on
+        # failure (caller checks for non-empty result).
+        download_to_temp() {
+          local URL="$1"
+          local OUT="$2"
+          curl -fsSL --max-time 20 \
+            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" \
+            -H "Accept: image/*,*/*;q=0.8" \
+            -H "Accept-Language: en-US,en;q=0.9" \
+            -o "$OUT" "$URL" 2>/dev/null && [ -s "$OUT" ] && printf '%s' "$OUT"
+        }
+
         # Send each thumbnail with download button
         python3 - "$FILTERED" "$QUERY" "$PAGE" "$CHAT_ID" "$API" << 'PYEOF'
-        import json, os, subprocess, sys, urllib.parse
+        import json, os, subprocess, sys, tempfile, urllib.parse
 
         results = json.loads(sys.argv[1])
         query = sys.argv[2]
@@ -111,25 +153,81 @@ jobs:
         api = sys.argv[5]
         GROUP_CHAT_ID = os.environ.get('GROUP_CHAT_ID', '')
 
-        def send_photo(photo, keyboard=None):
-            cmd = ['curl', '-s', '-X', 'POST', f'{api}/sendPhoto',
-                   '-F', f'chat_id={chat_id}',
-                   '-F', f'photo={photo}']
-            if keyboard:
-                cmd.extend(['-F', f'reply_markup={json.dumps(keyboard)}'])
-            subprocess.run(cmd, capture_output=True)
+        TMPDIR = tempfile.mkdtemp(prefix='img_search_')
 
-        def send_photo_group(photo, caption='', keyboard=None):
-            if not GROUP_CHAT_ID or GROUP_CHAT_ID in ('', 'null', '0'):
-                return
-            cmd = ['curl', '-s', '-X', 'POST', f'{api}/sendPhoto',
-                   '-F', f'chat_id={GROUP_CHAT_ID}',
-                   '-F', f'photo={photo}']
-            if caption:
-                cmd.extend(['-F', f'caption={caption}'])
+        def download_to_temp(url, idx):
+            # Pick a tentative extension from the URL; the actual bytes get
+            # multipart-uploaded by Bale as-is, so the tmp name is just a label.
+            lower = url.lower().split('?')[0].split('#')[0]
+            if lower.endswith('.png'): ext = 'png'
+            elif lower.endswith('.gif'): ext = 'gif'
+            elif lower.endswith('.webp'): ext = 'webp'
+            elif lower.endswith('.svg'): ext = 'svg'
+            else: ext = 'jpg'
+            out = os.path.join(TMPDIR, f'thumb_{idx}.{ext}')
+            r = subprocess.run([
+                'curl', '-fsSL', '--max-time', '20',
+                '-H', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                '-H', 'Accept: image/*,*/*;q=0.8',
+                '-H', 'Accept-Language: en-US,en;q=0.9',
+                '-o', out, url
+            ], capture_output=True)
+            if r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
+                return out
+            return None
+
+        def send_with_retry(api_url, curl_args):
+            # 5 retries; 429 honors parameters.retry_after; 5xx backoff.
+            max_retries = 5
+            resp = b''
+            for i in range(1, max_retries + 1):
+                cmd = ['curl', '-s', '-X', 'POST', api_url] + curl_args
+                r = subprocess.run(cmd, capture_output=True)
+                resp = r.stdout or b''
+                text = resp.decode('utf-8', 'replace')
+                import re
+                m = re.search(r'"error_code":(\d+)', text)
+                err = int(m.group(1)) if m else None
+                if err == 429:
+                    m2 = re.search(r'"retry_after":(\d+)', text)
+                    retry_after = int(m2.group(1)) if m2 else 5
+                    print(f'send_with_retry: 429. Waiting {retry_after}s (attempt {i}/{max_retries})', file=sys.stderr)
+                    subprocess.run(['sleep', str(retry_after + 2)])
+                    continue
+                if err is not None and err >= 500:
+                    print(f'send_with_retry: Bale error_code={err} (attempt {i}/{max_retries})', file=sys.stderr)
+                    subprocess.run(['sleep', str(i)])
+                    continue
+                return text
+            return resp.decode('utf-8', 'replace')
+
+        def send_photo(photo_url, idx, keyboard=None):
+            local = download_to_temp(photo_url, idx)
+            if local is None:
+                # Last-ditch: pass the URL directly (Bale fetches it). We avoid
+                # this path because Bale's URL fetch fails under heavy load.
+                print(f'DOWNLOAD FAIL, falling back to URL: {photo_url}', file=sys.stderr)
+                curl_args = ['-F', f'chat_id={chat_id}', '-F', f'photo={photo_url}']
+            else:
+                curl_args = ['-F', f'chat_id={chat_id}', '-F', f'photo=@{local}']
             if keyboard:
-                cmd.extend(['-F', f'reply_markup={json.dumps(keyboard)}'])
-            subprocess.run(cmd, capture_output=True)
+                curl_args.extend(['-F', f'reply_markup={json.dumps(keyboard)}'])
+            return send_with_retry(f'{api}/sendPhoto', curl_args)
+
+        def send_photo_group(photo_url, idx, caption='', keyboard=None):
+            if not GROUP_CHAT_ID or GROUP_CHAT_ID in ('', 'null', '0'):
+                return ''
+            local = download_to_temp(photo_url, idx)
+            if local is None:
+                print(f'DOWNLOAD FAIL (group), falling back to URL: {photo_url}', file=sys.stderr)
+                curl_args = ['-F', f'chat_id={GROUP_CHAT_ID}', '-F', f'photo={photo_url}']
+            else:
+                curl_args = ['-F', f'chat_id={GROUP_CHAT_ID}', '-F', f'photo=@{local}']
+            if caption:
+                curl_args.extend(['-F', f'caption={caption}'])
+            if keyboard:
+                curl_args.extend(['-F', f'reply_markup={json.dumps(keyboard)}'])
+            return send_with_retry(f'{api}/sendPhoto', curl_args)
 
         def send_msg(text, keyboard=None):
             cmd = ['curl', '-s', '-X', 'POST', f'{api}/sendMessage',
@@ -153,8 +251,14 @@ jobs:
         for i, r in enumerate(results):
             cb = f"imgd:{urllib.parse.quote(query)}:{page}:{i}"
             kb = {"inline_keyboard": [[{"text": "⬇️ Download Full Resolution", "callback_data": cb}]]}
-            send_photo(r['t'], kb)
-            send_photo_group(r['t'], f'🖼 "{query}" — Page {page}')
+            send_photo(r['t'], i, kb)
+            # Small delay to avoid rate-limiting between individual sends
+            subprocess.run(['sleep', '0.5'])
+            send_photo_group(r['t'], i + 100, f'🖼 "{query}" — Page {page}')
+            subprocess.run(['sleep', '0.5'])
+
+        # Clean up tmp dir
+        subprocess.run(['rm', '-rf', TMPDIR])
 
         # Navigation message
         nav = []

@@ -526,6 +526,36 @@ jobs:
       run: |
         URL="${{ steps.inputs.outputs.url }}"
 
+        # send_with_retry: POST to any Bale API method with curl multipart (-F ...)
+        # args. Retries on HTTP 429 (honoring parameters.retry_after) and 5xx up to
+        # MAX_RETRIES times. Returns the LAST response body (no HTTP line appended).
+        # Usage: send_with_retry <api_url> [curl args ...]
+        send_with_retry() {
+          local API_URL="$1"; shift
+          local MAX_RETRIES=5
+          local RESP BODY ERROR_CODE RETRY_AFTER
+          for i in $(seq 1 $MAX_RETRIES); do
+            RESP=$(curl -s -X POST "$API_URL" "$@")
+            # Bale/Telegram response is JSON; error_code lives at top-level.
+            ERROR_CODE=$(printf '%s' "$RESP" | grep -o '"error_code":[0-9]*' | head -1 | cut -d: -f2)
+            if [ "$ERROR_CODE" = "429" ]; then
+              RETRY_AFTER=$(printf '%s' "$RESP" | grep -o '"retry_after":[0-9]*' | head -1 | cut -d: -f2)
+              RETRY_AFTER=${RETRY_AFTER:-5}
+              echo "send_with_retry: 429. Waiting ${RETRY_AFTER}s (attempt $i/$MAX_RETRIES)" >&2
+              sleep $((RETRY_AFTER + 2))
+              continue
+            fi
+            if [ -n "$ERROR_CODE" ] && [ "$ERROR_CODE" -ge 500 ] 2>/dev/null; then
+              echo "send_with_retry: Bale error_code=$ERROR_CODE (attempt $i/$MAX_RETRIES)" >&2
+              sleep $i
+              continue
+            fi
+            printf '%s' "$RESP"
+            return 0
+          done
+          printf '%s' "$RESP"
+        }
+
         # Send images as album BEFORE posting text to worker (user preference: album first).
         IMG_COUNT=$(python3 -c "
           import json
@@ -626,13 +656,12 @@ jobs:
             done
 
             echo "Sending ${DOWNLOADED} image(s) as media group..."
-            RESP=$(curl -s -w "\n%{http_code}" -X POST "${API_URL}/sendMediaGroup" "${CURL_ARGS[@]}" 2>&1)
-            HTTP_CODE=$(echo "$RESP" | tail -n 1)
-            BODY=$(echo "$RESP" | head -n -1)
-            echo "sendMediaGroup HTTP=${HTTP_CODE} body=$(printf '%s' "$BODY" | head -c 500)"
+            RESP=$(send_with_retry "${API_URL}/sendMediaGroup" "${CURL_ARGS[@]}")
+            echo "sendMediaGroup response: $(printf '%s' "$RESP" | head -c 500)"
 
-            # Fallback: if sendMediaGroup failed, send each image individually via sendPhoto.
-            if [ "$HTTP_CODE" != "200" ] || ! echo "$BODY" | grep -q '"message_id"'; then
+            # Fallback: if sendMediaGroup failed (no message_id in response body),
+            # send each image individually via sendPhoto (also via send_with_retry).
+            if ! printf '%s' "$RESP" | grep -q '"message_id"'; then
               echo "sendMediaGroup did not return a message_id — falling back to individual sendPhoto..."
               I=0
               for FILE in /tmp/url_images/photo_*.*; do
@@ -643,13 +672,13 @@ jobs:
                 else
                   CAP=""
                 fi
-                PH_RESP=$(curl -s -X POST "${API_URL}/sendPhoto" \
-                  -F chat_id="$CHAT_ID" \
+                PH_RESP=$(send_with_retry "${API_URL}/sendPhoto" \
+                  -F "chat_id=$CHAT_ID" \
                   -F "photo=@${FILE}" \
-                  -F "caption=${CAP}" 2>&1)
+                  -F "caption=${CAP}")
                 echo "sendPhoto[$I] : $(printf '%s' "$PH_RESP" | head -c 300)"
                 I=$((I + 1))
-                # Small delay to avoid rate-limiting
+                # Small delay to avoid rate-limiting between individual sends
                 sleep 1
               done
             fi
