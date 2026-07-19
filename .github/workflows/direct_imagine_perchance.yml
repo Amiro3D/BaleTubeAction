@@ -77,7 +77,7 @@ jobs:
         # fetches image bytes, writes them to $OUTFILE. Prints extension to
         # stdout on success; on failure, prints "ERROR: <reason>" to stdout.
         GENRESULT=$(python << 'PYEOF'
-        import asyncio, base64, json, os, random, re, sys
+        import asyncio, json, os, random, re, sys
 
         API = "https://image-generation.perchance.org/api"
         PROMPT = os.environ["PROMPT"]
@@ -117,40 +117,100 @@ jobs:
                 )
                 page = await ctx.new_page()
 
-                # 1. Warm up Cloudflare cookies on the apex domain. Visit,
-                # wait briefly for any silent Turnstile to resolve, then proceed.
-                try:
-                    await page.goto("https://perchance.org",
-                                    wait_until="domcontentloaded", timeout=30000)
-                    await page.wait_for_timeout(2500)
-                except Exception as e:
-                    # Warmup is best-effort; some IPs may skip it entirely and
-                    # verifyUser will still mint. Continue regardless.
-                    print(f"warmup warning: {e}", file=sys.stderr)
+                # 1. Mint userKey. Strategy: visit the human-facing
+                # https://perchance.org/ai-text-to-image-generator page and let
+                # its own JS populate window.__USER_DATA__ (which contains the
+                # userKey). This is what a real browser session would do, so
+                # Cloudflare's silent Turnstile auto-passes and Perchance's
+                # JS handler writes the key into the page it already trusts.
+                # Fallback: hit /api/verifyUser directly and regex-scrape the
+                # "userKey":"..." string out of the resulting HTML.
+                user_key = None
+                last_diag = ""
 
-                # 2. Mint userKey via verifyUser (Cloudflare Turnstile auto-passes
-                # in real Chromium with --disable-blink-features=AutomationControlled).
-                cache_bust = random.random()
-                verify_url = f"{API}/verifyUser?thread=0&__cacheBust={cache_bust}"
-                await page.goto(verify_url, wait_until="domcontentloaded", timeout=30000)
-                content = await page.content()
+                async def try_mint_via_page(pages_url):
+                    """Navigate to a Perchance page; wait for window.__USER_DATA__."""
+                    nonlocal last_diag
+                    for attempt in range(3):
+                        try:
+                            await page.goto(pages_url,
+                                            wait_until="domcontentloaded",
+                                            timeout=45000)
+                            # Cloudflare's silent Turnstile takes 5-10s to
+                            # solve and write cookies. Wait for either
+                            # window.__USER_DATA__ to appear, or 25s max.
+                            try:
+                                await page.wait_for_function(
+                                    "() => !!(window.__USER_DATA__ && window.__USER_DATA__.userKey)",
+                                    timeout=25000
+                                )
+                            except Exception:
+                                # Page loaded but __USER_DATA__ never arrived.
+                                # Fall through and report the page state.
+                                pass
+                            dat = await page.evaluate(
+                                "() => (window.__USER_DATA__ && window.__USER_DATA__.userKey) ? window.__USER_DATA__.userKey : null"
+                            )
+                            if dat and re.fullmatch(r"[a-f0-9]{64}", dat):
+                                return dat
+                        except Exception as e:
+                            last_diag += f"page-attempt{attempt} err={e}; "
+                        await page.wait_for_timeout(2500)
+                    return None
 
-                if "too_many_requests" in content:
-                    await browser.close()
-                    print("ERROR:RATE_LIMIT")
-                    return
+                async def try_mint_via_verifyuser():
+                    """Hit /api/verifyUser directly and regex out userKey."""
+                    nonlocal last_diag
+                    for attempt in range(3):
+                        cache_bust = random.random()
+                        verify_url = f"{API}/verifyUser?thread=0&__cacheBust={cache_bust}"
+                        try:
+                            await page.goto(verify_url,
+                                            wait_until="domcontentloaded",
+                                            timeout=45000)
+                            await page.wait_for_timeout(2000)
+                            content = await page.content()
+                            if "too_many_requests" in content:
+                                return ("RATE_LIMIT", None)
+                            m = re.search(r'"userKey":"([a-f0-9]{64})"', content)
+                            if m:
+                                return (None, m.group(1))
+                            try:
+                                title = await page.title()
+                            except Exception:
+                                title = "<no title>"
+                            last_diag += (
+                                f"verify-attempt{attempt} "
+                                f"title={title!r} "
+                                f"bodylen={len(content)} "
+                                f"snippet={content[:200]!r}; "
+                            )
+                        except Exception as e:
+                            last_diag += f"verify-attempt{attempt} err={e}; "
+                        await page.wait_for_timeout(2500)
+                    return (None, None)
 
-                m = re.search(r'"userKey":"([a-f0-9]{64})"', content)
-                if not m:
-                    await browser.close()
-                    # Cloudflare challenge persisted — the verifyUser response did
-                    # not contain a userKey, most likely "token_required".
-                    print("ERROR:CF_CHALLENGE")
-                    return
-                user_key = m.group(1)
+                user_key = await try_mint_via_page("https://perchance.org/ai-text-to-image-generator")
+                if not user_key:
+                    print(f"mint: page fallback to verifyUser. diag={last_diag}", file=sys.stderr)
+                    err, key = await try_mint_via_verifyuser()
+                    if err == "RATE_LIMIT":
+                        await browser.close()
+                        print("ERROR:RATE_LIMIT")
+                        return
+                    if key:
+                        user_key = key
+                    else:
+                        print(f"mint failed: cf challenge. diag={last_diag}", file=sys.stderr)
+                        await browser.close()
+                        print("ERROR:CF_CHALLENGE")
+                        return
 
-                # 3. POST /api/generate. We do this inside page.evaluate so the
-                # Cloudflare cookies inherited from the warmup carry along.
+                # 2. POST /api/generate and download via the page.request helper
+                # (an APIRequestContext bound to this browser context). It uses
+                # the same cookies/UA as the page itself and bypasses CORS,
+                # which lets us call image-generation.perchance.org from the
+                # perchance.org origin without CORS preflight issues.
                 gen_url = (f"{API}/generate"
                            f"?userKey={user_key}"
                            f"&requestId=aiImageCompletion{random.randint(0, 2**30)}"
@@ -165,35 +225,26 @@ jobs:
                     "resolution":     resolution,
                     "guidanceScale":  7.0,
                 }
-                gen_json = await page.evaluate("""
-                    async ({url, body}) => {
-                        const r = await fetch(url, {
-                            method: 'POST',
-                            headers: {'Content-Type': 'application/json'},
-                            body: JSON.stringify(body),
-                        });
-                        const text = await r.text();
-                        try { return JSON.parse(text); }
-                        catch (e) { return {status: 'parse_error', body: text.slice(0, 200)}; }
-                    }
-                """, {"url": gen_url, "body": body})
+
+                async def post_generate():
+                    r = await page.request.post(gen_url, {
+                        "headers": {"Content-Type": "application/json"},
+                        "data": json.dumps(body),
+                        "timeout": 60000,
+                    })
+                    text = await r.text()
+                    try:
+                        return json.loads(text)
+                    except Exception:
+                        return {"status": "parse_error", "body": text[:200]}
+
+                gen_json = await post_generate()
 
                 # The Perchance generator sometimes returns {"status":"generating"}
                 # in heavy-load cases; re-issue once with the same params.
                 if gen_json.get("status") == "generating":
                     await page.wait_for_timeout(3000)
-                    gen_json = await page.evaluate("""
-                        async ({url, body}) => {
-                            const r = await fetch(url, {
-                                method: 'POST',
-                                headers: {'Content-Type': 'application/json'},
-                                body: JSON.stringify(body),
-                            });
-                            const text = await r.text();
-                            try { return JSON.parse(text); }
-                            catch (e) { return {status: 'parse_error', body: text.slice(0, 200)}; }
-                        }
-                    """, {"url": gen_url, "body": body})
+                    gen_json = await post_generate()
 
                 if gen_json.get("status") != "success":
                     reason = gen_json.get("reason") or gen_json.get("status") or "unknown"
@@ -205,9 +256,9 @@ jobs:
                 file_ext    = (gen_json.get("fileExtension") or "jpeg").lstrip(".")
                 proxy_url   = gen_json.get("imageDownloadUrl")
 
-                # 4. Download. Prefer the proxy URL (modern path), fall back to
+                # 3. Download. Prefer the proxy URL (modern path), fall back to
                 # the classic /api/downloadTemporaryImage?imageId= route. Both
-                # are called from inside page.evaluate to inherit cookies.
+                # are fetched via page.request so browser cookies travel.
                 download_urls = []
                 if isinstance(proxy_url, str) and proxy_url:
                     if proxy_url.startswith("http"):
@@ -221,42 +272,36 @@ jobs:
                 if image_id:
                     download_urls.append(f"{API}/downloadTemporaryImage?imageId={image_id}")
 
-                b64_bytes = await page.evaluate("""
-                    async (urls) => {
-                        for (const url of urls) {
-                            try {
-                                const r = await fetch(url);
-                                if (!r.ok) continue;
-                                const blob = await r.blob();
-                                const b64 = await new Promise(resolve => {
-                                    const reader = new FileReader();
-                                    reader.onloadend = () => resolve(reader.result.split(',')[1]);
-                                    reader.readAsDataURL(blob);
-                                });
-                                return {b64, ct: blob.type};
-                            } catch (e) { continue; }
-                        }
-                        return null;
-                    }
-                """, download_urls)
+                image_bytes = None
+                content_type = ""
+                for url in download_urls:
+                    try:
+                        r = await page.request.get(url, {"timeout": 60000})
+                        if not r.ok:
+                            continue
+                        buf = await r.body()
+                        if buf and len(buf) > 0:
+                            image_bytes = buf
+                            content_type = (r.headers.get("content-type") or "").lower()
+                            break
+                    except Exception:
+                        continue
 
                 await browser.close()
 
-                if not b64_bytes or not b64_bytes.get("b64"):
+                if not image_bytes:
                     print("ERROR:DOWNLOAD")
                     return
 
                 # Save bytes to OUTFILE; derive a sensible extension from Content-Type.
-                data = base64.b64decode(b64_bytes["b64"])
                 with open(OUTFILE, "wb") as f:
-                    f.write(data)
+                    f.write(image_bytes)
 
-                ct = (b64_bytes.get("ct") or "").lower()
-                if "png" in ct:
+                if "png" in content_type:
                     ext = "png"
-                elif "webp" in ct:
+                elif "webp" in content_type:
                     ext = "webp"
-                elif "jpeg" in ct or "jpg" in ct:
+                elif "jpeg" in content_type or "jpg" in content_type:
                     ext = "jpg"
                 else:
                     # Use the fileExtension field Perchance returned.
