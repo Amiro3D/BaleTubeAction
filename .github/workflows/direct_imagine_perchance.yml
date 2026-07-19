@@ -71,6 +71,7 @@ jobs:
 
         OUTFILE="/tmp/imagine_$$.jpg"
         OUTEXT="jpg"
+        export OUTFILE
 
         # Main Python step — Playwright mints userKey, POSTs /api/generate,
         # fetches image bytes, writes them to $OUTFILE. Prints extension to
@@ -265,6 +266,15 @@ jobs:
         asyncio.run(main())
         PYEOF
         )
+        PYEXIT=$?
+        if [ $PYEXIT -ne 0 ] || [ -z "$GENRESULT" ]; then
+          # Python crashed before printing OK/ERROR (e.g. a missing env
+          # var, Playwright launch failure, unhandled exception, etc.).
+          # Surface a best-effort message so the user is not stuck with
+          # the generic "unknown error" branch.
+          notify_user "❌ خطای داخلی اسکریپت. ممکنه Perchance موقتاً مسدود باشه — چند دقیقه بعد دوباره امتحان کن."
+          exit 0
+        fi
         echo "GENRESULT=$GENRESULT"
 
         # Failure handling — the Python script prints ERROR:* on failures.
