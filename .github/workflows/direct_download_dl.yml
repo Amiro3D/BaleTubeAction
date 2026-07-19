@@ -55,19 +55,25 @@ jobs:
         # to headers.txt so we can derive filename + extension from Content-Disposition
         # and Content-Type — important for URLs with no extension in the path
         # (e.g. https://thunderstore.io/package/download/.../1.0.0/ which redirects to a zip).
-        HTTP_CODE=$(curl -L -f -s -w "%{http_code}" \
+        # Also capture the final URL after redirects ("%{url_effective}") — its basename
+        # usually carries the real filename (e.g. yazirushi-FairyMode-1.0.0.zip) when the
+        # original URL was a route that responded with 302 to the actual file.
+        DL_OUT=$(curl -L -f -s -w "\n%{http_code}\n%{url_effective}" \
           -D headers.txt \
           -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" \
           -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
           -H "Accept-Language: en-US,en;q=0.9" \
           -H "Referer: $(echo "$URL" | sed 's|^\(https\?://[^/]*\).*|\1|')" \
           -o "downloaded_file" \
-          "$URL" 2>/dev/null || echo "000")
+          "$URL" 2>/dev/null || printf '\n000\n')
+        HTTP_CODE=$(echo "$DL_OUT" | tail -2 | head -1)
+        EFFECTIVE_URL=$(echo "$DL_OUT" | tail -1)
 
-        # If browser headers failed, try direct (re-capture headers too)
+        # If browser headers failed, try direct (re-capture headers + effective URL too)
         if [ "$HTTP_CODE" = "000" ] || [ ! -s "downloaded_file" ]; then
           echo "Browser headers failed, trying direct download..."
-          curl -fSL -D headers.txt -o "downloaded_file" "$URL" 2>&1 || true
+          DL_OUT=$(curl -fSL -w "\n%{url_effective}" -D headers.txt -o "downloaded_file" "$URL" 2>&1 || printf '\n' )
+          EFFECTIVE_URL=$(echo "$DL_OUT" | tail -1)
         fi
 
         if [ ! -s "downloaded_file" ]; then
@@ -78,44 +84,126 @@ jobs:
 
         FILE_SIZE=$(stat -c%s "downloaded_file" 2>/dev/null || stat -f%z "downloaded_file" 2>/dev/null || echo 0)
         echo "Downloaded: $FILE_SIZE bytes"
+        echo "Original URL:  $URL"
+        echo "Effective URL: ${EFFECTIVE_URL:-<none>}"
 
-        # Get filename from URL
-        RAW_NAME=$(basename "$URL" | sed 's/[?#].*//')
-        if [ -z "$RAW_NAME" ] || [ "$RAW_NAME" = "index.html" ] || [ "$RAW_NAME" = "/" ]; then
+        # Get filename from the FINAL redirected URL (the post-redirect URL usually has the
+        # real filename in its basename). Fall back to the original URL only if effective
+        # URL is empty/identical/helpless.
+        derive_rawname() {
+          local u="$1"
+          local n
+          n=$(basename "$u" | sed 's/[?#].*//')
+          # Strip trailing slash so basename works on URLs ending with /
+          n=$(echo "$u" | sed 's|/*$||' | awk -F/ '{print $NF}' | sed 's/[?#].*//')
+          if [ -z "$n" ] || [ "$n" = "index.html" ] || [ "$n" = "/" ]; then
+            n=""
+          fi
+          echo "$n"
+        }
+
+        RAW_NAME=""
+        if [ -n "$EFFECTIVE_URL" ] && [ "$EFFECTIVE_URL" != "$URL" ]; then
+          RAW_NAME=$(derive_rawname "$EFFECTIVE_URL")
+        fi
+        # Fall back to original URL if the effective URL gave nothing useful
+        if [ -z "$RAW_NAME" ]; then
+          RAW_NAME=$(derive_rawname "$URL")
+        fi
+        if [ -z "$RAW_NAME" ]; then
           RAW_NAME="download"
         fi
-        # Remove extension from raw name for clean naming
-        URL_EXT="${RAW_NAME##*.}"
-        if [ "$URL_EXT" = "$RAW_NAME" ]; then
-          URL_EXT=""
+
+        # Detect whether the URL basename actually has an extension. A bare
+        # "1.0.0" route segment has dots but no real ext — its last ".x" is just
+        # part of a version, not a file extension. Require the part after the
+        # last dot to look extension-like (≤5 chars, alphanumeric) AND we accept
+        # Content-Type / Content-Disposition as authoritative overrides anyway.
+        has_url_ext() {
+          local n="$1"
+          local last="${n##*.}"
+          if [ "$last" = "$n" ]; then return 1; fi                    # no dot at all
+          if [ ${#last} -gt 5 ]; then return 1; fi                    # too long to be an ext
+          if ! echo "$last" | grep -qE '^[a-zA-Z0-9]+$'; then return 1; fi
+          # Plausible extension — but skip if it looks like a version segment
+          # (numeric-only and the segment before the dot also starts with a digit
+          # or is itself dotted-versiony, e.g. "1.0.0" → last="0", prev="1.0")
+          if echo "$last" | grep -qE '^[0-9]+$'; then
+            local prev="${n%.*}"           # strip last .ext
+            if echo "$prev" | grep -qE '\.[0-9]'; then return 1; fi  # version-like → not an ext
+          fi
+          return 0
+        }
+
+        URL_EXT=""
+        if has_url_ext "$RAW_NAME"; then
+          URL_EXT="${RAW_NAME##*.}"
         fi
-        BASE_NAME=$(echo "$RAW_NAME" | sed 's/\.[^.]*$//')
-        SAFE_NAME=$(echo "$BASE_NAME" | sed 's/[^a-zA-Z0-9\-]/_/g' | sed 's/__*/_/g' | cut -c1-100)
+
+        BASE_NAME="${RAW_NAME%.*}"
+        # Path-segment "1.0.0" already passed through has_url_ext=false, so .0 wasn't
+        # stripped — BASE_NAME stays the full "1.0.0". That's fine: Content-Type
+        # sniff will provide the extension.
+        [ "$BASE_NAME" = "$RAW_NAME" ] || true
+
+        # Sanitise for use as a filename. Allow letters, digits, dash, dot, underscore.
+        # Reject filesystem-dangerous chars: / \ : * ? " < > | and control chars.
+        sanitize_name() {
+          echo "$1" | sed -e 's/[\/\\:*?"<>|]/_/g' -e 's/[[:cntrl:]]//g' | sed 's/^[. ]*//' | sed 's/__*/_/g' | cut -c1-150
+        }
+        SAFE_NAME=$(sanitize_name "$BASE_NAME")
+        if [ -z "$SAFE_NAME" ]; then SAFE_NAME="download"; fi
 
         # Derive the final filename + extension.
-        # Priority: Content-Disposition header > URL basename extension > Content-Type sniff.
+        # Priority for the FULL filename (base + ext together):
+        #   1. Content-Disposition header filename
+        #   2. Effective (post-redirect) URL basename (e.g. yazirushi-FairyMode-1.0.0.zip)
+        #   3. Original URL basename (only if it has a real extension)
+        # Priority for the EXTENSION when a base-with-no-ext was found:
+        #   1. Content-Disposition filename's extension
+        #   2. Effective URL's extension
+        #   3. Original URL extension (only if above judged it real)
+        #   4. Content-Type sniff
         FINAL_EXT=""
+        FINAL_NAME=""
         DISP_NAME=""
 
-        # Content-Disposition: attachment; filename="name.zip" OR filename*=UTF-8''name.zip
+        # --- 1. Content-Disposition ---
         DISP_LINE=$(grep -i '^content-disposition:' headers.txt 2>/dev/null | tail -1 || true)
         if [ -n "$DISP_LINE" ]; then
           # Try filename*= (RFC 5987) first, then plain filename=
           STAR=$(echo "$DISP_LINE" | grep -oiE "filename\*=[^;]+" | head -1 | sed -E "s/.*=UTF-8'([^']+)'?.*/\1/I; s/.*=([^;]+)/\1/" | tr -d "\"' " || true)
           PLAIN=$(echo "$DISP_LINE" | grep -oiE 'filename="?[^";]+' | head -1 | sed -E 's/filename="?//I' | tr -d '"' || true)
           if [ -n "$STAR" ]; then DISP_NAME="$STAR"; elif [ -n "$PLAIN" ]; then DISP_NAME="$PLAIN"; fi
-          if [ -n "$DISP_NAME" ]; then
-            DISP_EXT="${DISP_NAME##*.}"
-            if [ "$DISP_EXT" != "$DISP_NAME" ]; then FINAL_EXT="$DISP_EXT"; fi
+        fi
+
+        # --- Pick a "full filename" candidate (base + ext together) ---
+        FULL_CANDIDATE=""
+        if [ -n "$DISP_NAME" ]; then
+          FULL_CANDIDATE="$DISP_NAME"
+        elif [ -n "$EFFECTIVE_URL" ] && [ "$EFFECTIVE_URL" != "$URL" ]; then
+          # Effective URL basename may already carry base.ext (e.g. yazirushi-FairyMode-1.0.0.zip)
+          EFF_BASE=$(derive_rawname "$EFFECTIVE_URL")
+          if [ -n "$EFF_BASE" ] && has_url_ext "$EFF_BASE"; then
+            FULL_CANDIDATE="$EFF_BASE"
+          fi
+        fi
+        # Fall back to original URL basename only if it has a real extension
+        if [ -z "$FULL_CANDIDATE" ] && has_url_ext "$RAW_NAME"; then
+          FULL_CANDIDATE="$RAW_NAME"
+        fi
+
+        # --- Split FULL_CANDIDATE into base + ext, if it has a real one ---
+        if [ -n "$FULL_CANDIDATE" ]; then
+          if has_url_ext "$FULL_CANDIDATE"; then
+            FINAL_EXT="${FULL_CANDIDATE##*.}"
+            FINAL_NAME="${FULL_CANDIDATE%.*}"
+          else
+            FINAL_NAME="$FULL_CANDIDATE"
           fi
         fi
 
-        # Fall back to URL extension
-        if [ -z "$FINAL_EXT" ] && [ -n "$URL_EXT" ]; then
-          FINAL_EXT="$URL_EXT"
-        fi
-
-        # Fall back to Content-Type sniffing
+        # --- 4. Fall back to Content-Type sniff for extension when we still have none ---
         if [ -z "$FINAL_EXT" ]; then
           CT=$(grep -i '^content-type:' headers.txt 2>/dev/null | tail -1 | sed -E 's/^[Cc]ontent-[Tt]ype:[[:space:]]*//I; s/;.*//' | tr -d ' \r' || true)
           case "$CT" in
@@ -142,13 +230,16 @@ jobs:
           esac
         fi
 
-        # If we got a real filename from Content-Disposition, prefer it (sanitised) as the base name
-        FINAL_NAME="$SAFE_NAME"
-        if [ -n "$DISP_NAME" ]; then
-          DISP_BASE=$(echo "$DISP_NAME" | sed 's/\.[^.]*$//' | sed 's/[^a-zA-Z0-9\-]/_/g' | sed 's/__*/_/g' | cut -c1-100)
-          if [ -n "$DISP_BASE" ]; then FINAL_NAME="$DISP_BASE"; fi
+        # --- If we never found a base name, fall back to SAFE_NAME (URL-derived, sanitised) ---
+        if [ -z "$FINAL_NAME" ]; then
+          FINAL_NAME="$SAFE_NAME"
+        else
+          # Sanitise the chosen base name (allow dots, dashes, underscores, alnum)
+          FINAL_NAME=$(sanitize_name "$FINAL_NAME")
         fi
+        [ -n "$FINAL_NAME" ] || FINAL_NAME="download"
 
+        # FINAL_FILE is the complete local filename (base + .ext)
         FINAL_FILE="${FINAL_NAME}"
         if [ -n "$FINAL_EXT" ]; then FINAL_FILE="${FINAL_NAME}.${FINAL_EXT}"; fi
 
@@ -157,9 +248,10 @@ jobs:
         # Belt-and-suspenders: keep downloaded_file as a fallback too
         [ -f "downloaded_file" ] || ln -sf "${FINAL_FILE}" "downloaded_file"
 
-        echo "Derived final filename: ${FINAL_FILE} (ext=${FINAL_EXT:-none})"
+        echo "Derived final filename: ${FINAL_FILE} (base=${FINAL_NAME} ext=${FINAL_EXT:-none})"
         echo "file=${FINAL_FILE}" >> $GITHUB_OUTPUT
         echo "final_file=${FINAL_FILE}" >> $GITHUB_OUTPUT
+        echo "final_name=${FINAL_NAME}" >> $GITHUB_OUTPUT
         echo "file_ext=${FINAL_EXT}" >> $GITHUB_OUTPUT
         echo "file_size=${FILE_SIZE}" >> $GITHUB_OUTPUT
         echo "safe_name=${SAFE_NAME}" >> $GITHUB_OUTPUT
@@ -174,6 +266,7 @@ jobs:
         FILE_SIZE: ${{ steps.download.outputs.file_size }}
         SAFE_NAME: ${{ steps.download.outputs.safe_name }}
         FINAL_FILE: ${{ steps.download.outputs.final_file }}
+        FINAL_NAME: ${{ steps.download.outputs.final_name }}
         FILE_EXT: ${{ steps.download.outputs.file_ext }}
         SPLIT_SIZE: ${{ steps.inputs.outputs.split_size }}
         GROUP_CHAT_ID: ${{ steps.inputs.outputs.group_chat_id }}
@@ -228,15 +321,19 @@ jobs:
         # Fall back to downloaded_file if the output was empty (shouldn't happen).
         FILE="${FINAL_FILE:-downloaded_file}"
         [ -f "$FILE" ] || FILE="downloaded_file"
+        # SPLIT_BASE is the name used for split archive parts: file.zip, file.z01, ...
+        # Use FINAL_NAME (the sanitised base WITHOUT extension) if available, else SAFE_NAME.
+        SPLIT_BASE="${FINAL_NAME:-$SAFE_NAME}"
+        [ -n "$SPLIT_BASE" ] || SPLIT_BASE="download"
         FILE_BYTES=$(stat -c%s "$FILE" 2>/dev/null || stat -f%z "$FILE" 2>/dev/null || echo 0)
         SPLIT_MB="${SPLIT_SIZE:-45}"
         SPLIT_BYTES=$((SPLIT_MB * 1048576))
 
         if [ "$FILE_BYTES" -gt "$SPLIT_BYTES" ]; then
           echo "File exceeds ${SPLIT_MB}MB ($FILE_BYTES bytes). Splitting..."
-          zip -s ${SPLIT_MB}m "${SAFE_NAME}.zip" "$FILE"
+          zip -s ${SPLIT_MB}m "${SPLIT_BASE}.zip" "$FILE"
           TOTAL_PARTS=0
-          for sp in ${SAFE_NAME}.z*; do
+          for sp in ${SPLIT_BASE}.z*; do
             [ -f "$sp" ] && TOTAL_PARTS=$((TOTAL_PARTS + 1))
           done
           if [ "$TOTAL_PARTS" -eq 0 ]; then
@@ -246,14 +343,14 @@ jobs:
           fi
           echo "Split into $TOTAL_PARTS parts"
           PART_NUM=0
-          for sp in ${SAFE_NAME}.zip ${SAFE_NAME}.z[0-9]*; do
+          for sp in ${SPLIT_BASE}.zip ${SPLIT_BASE}.z[0-9]*; do
             [ -f "$sp" ] || continue
             PART_NUM=$((PART_NUM + 1))
             echo "Sending part $PART_NUM/$TOTAL_PARTS: $sp"
             RESP=$(send_with_retry "${API_URL}/sendDocument" \
               -F chat_id="$CHAT_ID" \
               -F document=@"$sp" \
-              -F caption="📦 Part ${PART_NUM}/${TOTAL_PARTS} — ${SAFE_NAME}")
+              -F caption="📦 Part ${PART_NUM}/${TOTAL_PARTS} — ${SPLIT_BASE}")
             # Forward each part to group immediately
             if [ -n "$GROUP_CHAT_ID" ] && [ "$GROUP_CHAT_ID" != "null" ]; then
               MID=$(echo "$RESP" | grep -o '"message_id":[0-9]*' | head -1 | cut -d: -f2)
