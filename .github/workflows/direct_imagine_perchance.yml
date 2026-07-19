@@ -1,0 +1,347 @@
+name: AI Imagine (Perchance)
+
+on:
+  repository_dispatch:
+    types: [bale_imagine]
+
+jobs:
+  imagine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+    - name: Generate image and send to Bale
+      env:
+        BALE_BOT_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
+        PROMPT: ${{ github.event.client_payload.prompt }}
+        SHAPE: ${{ github.event.client_payload.shape || 'square' }}
+        SEED: ${{ github.event.client_payload.seed || '-1' }}
+        CHAT_ID: ${{ github.event.client_payload.chat_id }}
+        MSG_ID: ${{ github.event.client_payload.msg_id || '' }}
+        GROUP_CHAT_ID: ${{ github.event.client_payload.group_chat_id || '' }}
+        WORKER_URL: ${{ secrets.WORKER_URL }}
+      run: |
+        set +e
+        echo "::group::Install Playwright"
+        python -m pip install --quiet --upgrade pip
+        python -m pip install --quiet playwright
+        python -m playwright install --with-deps chromium >/dev/null 2>&1
+        echo "::endgroup::"
+
+        API="https://tapi.bale.ai/bot${BALE_BOT_TOKEN}"
+
+        # send_with_retry: POST to a Bale API method with curl multipart args,
+        # retry on HTTP 429 (honoring retry_after) and 5xx. Returns last body.
+        send_with_retry() {
+          local API_URL="$1"; shift
+          local MAX_RETRIES=5
+          local RESP ERROR_CODE RETRY_AFTER
+          for i in $(seq 1 $MAX_RETRIES); do
+            RESP=$(curl -s -X POST "$API_URL" "$@")
+            ERROR_CODE=$(printf '%s' "$RESP" | grep -o '"error_code":[0-9]*' | head -1 | cut -d: -f2)
+            if [ "$ERROR_CODE" = "429" ]; then
+              RETRY_AFTER=$(printf '%s' "$RESP" | grep -o '"retry_after":[0-9]*' | head -1 | cut -d: -f2)
+              RETRY_AFTER=${RETRY_AFTER:-5}
+              echo "send_with_retry: 429. Sleeping ${RETRY_AFTER}s (attempt $i/$MAX_RETRIES)" >&2
+              sleep $((RETRY_AFTER + 2))
+              continue
+            fi
+            if [ -n "$ERROR_CODE" ] && [ "$ERROR_CODE" -ge 500 ] 2>/dev/null; then
+              echo "send_with_retry: Bale error_code=$ERROR_CODE (attempt $i/$MAX_RETRIES)" >&2
+              sleep "$i"
+              continue
+            fi
+            printf '%s' "$RESP"
+            return 0
+          done
+          printf '%s' "$RESP"
+        }
+
+        # notify_user: send a Persian error message and (optionally) delete
+        # the in-chat progress message. Used on every failure path.
+        notify_user() {
+          local TEXT="$1"
+          if [ -n "$MSG_ID" ]; then
+            curl -s -X POST "$API/deleteMessage" -F "chat_id=$CHAT_ID" -F "message_id=$MSG_ID" > /dev/null 2>&1 || true
+          fi
+          send_with_retry "$API/sendMessage" -F "chat_id=$CHAT_ID" -F "text=$TEXT" > /dev/null || true
+          if [ -n "$GROUP_CHAT_ID" ] && [ "$GROUP_CHAT_ID" != "0" ]; then
+            send_with_retry "$API/sendMessage" -F "chat_id=$GROUP_CHAT_ID" -F "text=$TEXT" > /dev/null || true
+          fi
+        }
+
+        OUTFILE="/tmp/imagine_$$.jpg"
+        OUTEXT="jpg"
+
+        # Main Python step — Playwright mints userKey, POSTs /api/generate,
+        # fetches image bytes, writes them to $OUTFILE. Prints extension to
+        # stdout on success; on failure, prints "ERROR: <reason>" to stdout.
+        GENRESULT=$(python << 'PYEOF'
+        import asyncio, base64, json, os, random, re, sys
+
+        API = "https://image-generation.perchance.org/api"
+        PROMPT = os.environ["PROMPT"]
+        SHAPE = os.environ.get("SHAPE", "square")
+        SEED_RAW = os.environ.get("SEED", "-1")
+        OUTFILE = os.environ["OUTFILE"]
+
+        try:
+            seed = int(SEED_RAW)
+        except Exception:
+            seed = -1
+
+        SHAPE_MAP = {
+            "square":    "768x768",
+            "portrait":  "512x768",
+            "landscape": "768x512",
+        }
+        resolution = SHAPE_MAP.get(SHAPE, "768x768")
+
+        from playwright.async_api import async_playwright
+
+        async def main():
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-blink-features=AutomationControlled",
+                    ],
+                )
+                ctx = await browser.new_context(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                               "AppleWebKit/537.36 (KHTML, like Gecko) "
+                               "Chrome/126.0.0.0 Safari/537.36",
+                    viewport={"width": 1280, "height": 800},
+                )
+                page = await ctx.new_page()
+
+                # 1. Warm up Cloudflare cookies on the apex domain. Visit,
+                # wait briefly for any silent Turnstile to resolve, then proceed.
+                try:
+                    await page.goto("https://perchance.org",
+                                    wait_until="domcontentloaded", timeout=30000)
+                    await page.wait_for_timeout(2500)
+                except Exception as e:
+                    # Warmup is best-effort; some IPs may skip it entirely and
+                    # verifyUser will still mint. Continue regardless.
+                    print(f"warmup warning: {e}", file=sys.stderr)
+
+                # 2. Mint userKey via verifyUser (Cloudflare Turnstile auto-passes
+                # in real Chromium with --disable-blink-features=AutomationControlled).
+                cache_bust = random.random()
+                verify_url = f"{API}/verifyUser?thread=0&__cacheBust={cache_bust}"
+                await page.goto(verify_url, wait_until="domcontentloaded", timeout=30000)
+                content = await page.content()
+
+                if "too_many_requests" in content:
+                    await browser.close()
+                    print("ERROR:RATE_LIMIT")
+                    return
+
+                m = re.search(r'"userKey":"([a-f0-9]{64})"', content)
+                if not m:
+                    await browser.close()
+                    # Cloudflare challenge persisted — the verifyUser response did
+                    # not contain a userKey, most likely "token_required".
+                    print("ERROR:CF_CHALLENGE")
+                    return
+                user_key = m.group(1)
+
+                # 3. POST /api/generate. We do this inside page.evaluate so the
+                # Cloudflare cookies inherited from the warmup carry along.
+                gen_url = (f"{API}/generate"
+                           f"?userKey={user_key}"
+                           f"&requestId=aiImageCompletion{random.randint(0, 2**30)}"
+                           f"&__cacheBust={random.random()}")
+                body = {
+                    "generatorName":  "ai-image-generator",
+                    "channel":        "ai-text-to-image-generator",
+                    "subChannel":     "public",
+                    "prompt":         PROMPT,
+                    "negativePrompt": "",
+                    "seed":           seed,
+                    "resolution":     resolution,
+                    "guidanceScale":  7.0,
+                }
+                gen_json = await page.evaluate("""
+                    async ({url, body}) => {
+                        const r = await fetch(url, {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify(body),
+                        });
+                        const text = await r.text();
+                        try { return JSON.parse(text); }
+                        catch (e) { return {status: 'parse_error', body: text.slice(0, 200)}; }
+                    }
+                """, {"url": gen_url, "body": body})
+
+                # The Perchance generator sometimes returns {"status":"generating"}
+                # in heavy-load cases; re-issue once with the same params.
+                if gen_json.get("status") == "generating":
+                    await page.wait_for_timeout(3000)
+                    gen_json = await page.evaluate("""
+                        async ({url, body}) => {
+                            const r = await fetch(url, {
+                                method: 'POST',
+                                headers: {'Content-Type': 'application/json'},
+                                body: JSON.stringify(body),
+                            });
+                            const text = await r.text();
+                            try { return JSON.parse(text); }
+                            catch (e) { return {status: 'parse_error', body: text.slice(0, 200)}; }
+                        }
+                    """, {"url": gen_url, "body": body})
+
+                if gen_json.get("status") != "success":
+                    reason = gen_json.get("reason") or gen_json.get("status") or "unknown"
+                    await browser.close()
+                    print(f"ERROR:GENERATE:{str(reason)[:80]}")
+                    return
+
+                image_id    = gen_json.get("imageId")
+                file_ext    = (gen_json.get("fileExtension") or "jpeg").lstrip(".")
+                proxy_url   = gen_json.get("imageDownloadUrl")
+
+                # 4. Download. Prefer the proxy URL (modern path), fall back to
+                # the classic /api/downloadTemporaryImage?imageId= route. Both
+                # are called from inside page.evaluate to inherit cookies.
+                download_urls = []
+                if isinstance(proxy_url, str) and proxy_url:
+                    if proxy_url.startswith("http"):
+                        download_urls.append(proxy_url)
+                    elif proxy_url.startswith("/"):
+                        download_urls.append("https://image-generation.perchance.org" + proxy_url)
+                    elif proxy_url.startswith("v1."):
+                        download_urls.append(
+                            "https://image-generation.perchance.org/downloadTemporaryImageViaProxy?t=" + proxy_url
+                        )
+                if image_id:
+                    download_urls.append(f"{API}/downloadTemporaryImage?imageId={image_id}")
+
+                b64_bytes = await page.evaluate("""
+                    async (urls) => {
+                        for (const url of urls) {
+                            try {
+                                const r = await fetch(url);
+                                if (!r.ok) continue;
+                                const blob = await r.blob();
+                                const b64 = await new Promise(resolve => {
+                                    const reader = new FileReader();
+                                    reader.onloadend = () => resolve(reader.result.split(',')[1]);
+                                    reader.readAsDataURL(blob);
+                                });
+                                return {b64, ct: blob.type};
+                            } catch (e) { continue; }
+                        }
+                        return null;
+                    }
+                """, download_urls)
+
+                await browser.close()
+
+                if not b64_bytes or not b64_bytes.get("b64"):
+                    print("ERROR:DOWNLOAD")
+                    return
+
+                # Save bytes to OUTFILE; derive a sensible extension from Content-Type.
+                data = base64.b64decode(b64_bytes["b64"])
+                with open(OUTFILE, "wb") as f:
+                    f.write(data)
+
+                ct = (b64_bytes.get("ct") or "").lower()
+                if "png" in ct:
+                    ext = "png"
+                elif "webp" in ct:
+                    ext = "webp"
+                elif "jpeg" in ct or "jpg" in ct:
+                    ext = "jpg"
+                else:
+                    # Use the fileExtension field Perchance returned.
+                    ext = "jpg" if file_ext in ("jpeg", "jpg", "") else file_ext
+                print("OK:" + ext)
+
+        asyncio.run(main())
+        PYEOF
+        )
+        echo "GENRESULT=$GENRESULT"
+
+        # Failure handling — the Python script prints ERROR:* on failures.
+        case "$GENRESULT" in
+          ERROR:RATE_LIMIT)
+            notify_user "❌ Perchance به محدودیت نرخ رسیده. چند دقیقه بعد امتحان کن."
+            exit 0
+            ;;
+          ERROR:CF_CHALLENGE)
+            notify_user "❌ ساخت تصویر به خاطر محدودیت Perchance انجام نشد. چند دقیقه بعد امتحان کن."
+            exit 0
+            ;;
+          ERROR:GENERATE:*)
+            REASON="${GENRESULT#ERROR:GENERATE:}"
+            notify_user "❌ ساخت تصویر ناموفق بود: ${REASON}"
+            exit 0
+            ;;
+          ERROR:DOWNLOAD)
+            notify_user "❌ تصویر ساخته شد ولی دانلود ناموفق بود. دوباره امتحان کن."
+            exit 0
+            ;;
+          ERROR:*)
+            notify_user "❌ خطای ناشناخته هنگام ساخت تصویر. دوباره امتحان کن."
+            exit 0
+            ;;
+          OK:*)
+            OUTEXT="${GENRESULT#OK:}"
+            ;;
+          *)
+            notify_user "❌ خطای ناشناخته هنگام ساخت تصویر. دوباره امتحان کن."
+            exit 0
+            ;;
+        esac
+
+        if [ ! -s "$OUTFILE" ]; then
+          notify_user "❌ تصویر ساخته شد ولی فایل خالیه. دوباره امتحان کن."
+          exit 0
+        fi
+
+        # Rename to the correct extension so Bale's content-type sniffing
+        # is happy (sendPhoto cares about the byte stream, not the name, but
+        # some clients preview based on the extension).
+        FINALFILE="/tmp/imagine_final_$$.${OUTEXT}"
+        mv "$OUTFILE" "$FINALFILE"
+
+        # Build the Persian caption that includes the prompt verbatim.
+        CAPTION="✨ «${PROMPT}»"
+
+        # Delete the progress message before sending the final image,
+        # so the user sees the result replace the "در حال ساخت..." text.
+        if [ -n "$MSG_ID" ]; then
+          curl -s -X POST "$API/deleteMessage" -F "chat_id=$CHAT_ID" -F "message_id=$MSG_ID" > /dev/null 2>&1 || true
+        fi
+
+        # Send the image to the user chat (multipart upload — Bale must
+        # NOT fetch a URL, per project policy).
+        RESP=$(send_with_retry "$API/sendPhoto" \
+          -F "chat_id=$CHAT_ID" \
+          -F "photo=@$FINALFILE" \
+          -F "caption=$CAPTION")
+        if echo "$RESP" | grep -q '"ok":false'; then
+          # Last-ditch: try as a document if Bale rejects the photo
+          # (occurs for unusual aspect ratios or formats).
+          send_with_retry "$API/sendDocument" \
+            -F "chat_id=$CHAT_ID" \
+            -F "document=@$FINALFILE" \
+            -F "caption=$CAPTION" > /dev/null || true
+        fi
+
+        # Optional group chat fan-out.
+        if [ -n "$GROUP_CHAT_ID" ] && [ "$GROUP_CHAT_ID" != "0" ]; then
+          GROUP_CAPTION="✨ AI Generated\n\n${PROMPT}"
+          send_with_retry "$API/sendPhoto" \
+            -F "chat_id=$GROUP_CHAT_ID" \
+            -F "photo=@$FINALFILE" \
+            -F "caption=$GROUP_CAPTION" > /dev/null || true
+        fi
+
+        rm -f "$FINALFILE"
+        exit 0
