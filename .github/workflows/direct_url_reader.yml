@@ -56,7 +56,10 @@ jobs:
               -d "{\"chat_id\":\"$CHAT_ID\",\"message_id\":\"$PROGRESS_MSG_ID\",\"progress\":\"$1\",\"status\":\"$2\"}" > /dev/null 2>&1 || true
           fi
         }
-        report_progress 20 "downloading"
+        # Note: we intentionally do NOT call report_progress here. The worker already
+        # edited the progress message to "📄 <title>\n🌐 <domain>\n⏳ صفحه به نظر JS-heavy
+        # می‌رسه — با مرورگر واقعی بارگذاری می‌کنم..." and a generic file-download
+        # status would only clobber that useful context. We finish by posting to /url-result.
 
         echo "WORKER_URL=${WORKER_URL}"
         URL="${{ steps.inputs.outputs.url }}"
@@ -311,32 +314,91 @@ jobs:
             let domain = '';
             try { domain = new URL(finalUrl).hostname; } catch (e) {}
 
-            // Extract images from the page (skip icons, ads, tiny images)
+            // Extract images from the page (skip icons, ads, tiny images).
+            // Modern SPAs lazy-load <img> via data-src / data-lazy-src / srcset, and
+            // many put their primary thumbnail in <meta property="og:image"> only.
+            // We collect from every plausible source and dedupe.
             const images = [];
             const imgSeen = new Set();
-            const imgEls = document.querySelectorAll('img[src]');
-            imgEls.forEach((img) => {
-              if (!isVisible(img)) return;
-              let src = img.getAttribute('src') || '';
+            const pushImage = (rawSrc) => {
+              if (!rawSrc) return;
+              let src = String(rawSrc).trim();
               if (!src || src.startsWith('data:')) return;
+              // srcset="url 1x, url2 2x" → take first URL before any space/comma
+              if (/srcset/i.test('srcset') || /\s\d+w/.test(src) || /\s\d+x/.test(src)) {
+                src = src.split(',')[0].trim().split(/\s+/)[0];
+              }
               try { src = new URL(src, window.location.href).href; } catch(e) { return; }
-              // Skip tiny images (icons, tracking pixels) — keep anything >= 50px
-              const w = img.naturalWidth || img.width || 0;
-              const h = img.naturalHeight || img.height || 0;
-              if (w > 0 && h > 0 && (w < 50 || h < 50)) return;
+              if (!/^https?:/i.test(src)) return;
               // Skip common ad/tracking patterns
-              if (/ad[s]?\//i.test(src) || /pixel/i.test(src) || /track/i.test(src) || /logo/i.test(src)) return;
+              if (/\/ad[s]?\//i.test(src) || /pixel/i.test(src) || /track/i.test(src)) return;
+              // Skip 1x1 tracking pixels by URL hint
+              if (/1x1/i.test(src)) return;
               if (imgSeen.has(src)) return;
               imgSeen.add(src);
               images.push(src);
-              if (images.length >= 10) return;
+            };
+            // 1) Plain <img src>
+            const imgEls = document.querySelectorAll('img');
+            imgEls.forEach((img) => {
+              if (!isVisible(img)) {
+                // Even invisible images may carry a real thumbnail in data-src/srcset;
+                // we'll allow them but later filter by natural size when available.
+              }
+              const src = img.getAttribute('src') || '';
+              const ds = img.getAttribute('data-src') || img.getAttribute('data-lazy-src')
+                       || img.getAttribute('data-original') || img.getAttribute('data-srcset')
+                       || img.getAttribute('data-lazy-srcset') || '';
+              const ss = img.getAttribute('srcset') || '';
+              // Use whichever attribute holds a real URL, in priority:
+              // srcset/data-srcset → 1st URL inside, then data-src/data-original, then src.
+              if (ss) pushImage(ss.split(',')[0]);
+              else if (ds) pushImage(ds);
+              else if (src && !/^data:/i.test(src)) pushImage(src);
             });
-            // Fallback: use og:image if no page images found
-            if (images.length === 0 && metaImageUrl) {
-              images.push(metaImageUrl);
+            // 2) <source srcset> inside <picture>
+            document.querySelectorAll('picture source[srcset]').forEach((s) => {
+              const ss = s.getAttribute('srcset') || '';
+              if (ss) pushImage(ss.split(',')[0]);
+            });
+            // 3) <meta property="og:image"> — strong thumbnail candidate
+            if (metaImageUrl) pushImage(metaImageUrl);
+            // 4) Twitter card image
+            const twImage = document.querySelector('meta[name="twitter:image"], meta[name="twitter:image:src"]');
+            if (twImage) pushImage(twImage.getAttribute('content') || '');
+            // 5) <link rel="image_src">
+            document.querySelectorAll('link[rel="image_src"]').forEach((l) => {
+              pushImage(l.getAttribute('href') || '');
+            });
+            // Now filter tiny images at the DOM level: walk back through the array
+            // and drop entries whose <img> DOM node actually rendered <50px. We can
+            // only check this for entries that came from a real <img> tag we still
+            // hold a reference to; og:image/twitter:card can't be checked, so keep them.
+            // Final cap: 10 images.
+            const finalImages = [];
+            const finalSeen = new Set();
+            for (const url of images) {
+              if (finalSeen.has(url)) continue;
+              finalSeen.add(url);
+              // Try to find the matching <img> in DOM, check its rendered size
+              const matching = Array.from(document.querySelectorAll('img')).find((im) => {
+                try { return new URL(im.currentSrc || im.getAttribute('src') || '', window.location.href).href === url; } catch(e) { return false; }
+              });
+              if (matching) {
+                const w = matching.naturalWidth || matching.width || 0;
+                const h = matching.naturalHeight || matching.height || 0;
+                if (w > 0 && h > 0 && (w < 50 || h < 50)) continue;        // tiny → skip
+                if (/\/logo[s]?\//i.test(url) || /logo/i.test(matching.getAttribute('class') || '')) continue;
+              }
+              finalImages.push(url);
+              if (finalImages.length >= 10) break;
+            }
+            // Always include og:image as the very last resort if nothing survived.
+            if (finalImages.length === 0 && metaImageUrl) {
+              finalImages.push(metaImageUrl);
             }
 
-            return { title, text: text.slice(0, 4000), links, images, url: finalUrl, domain, isChallengePage };
+            return { title, text: text.slice(0, 4000), links, images: finalImages, url: finalUrl, domain, isChallengePage };
           }, url);
 
           await browser.close();
@@ -453,7 +515,7 @@ jobs:
           exit 1
         fi
 
-        report_progress 80 "downloading"
+        # (Progress message is owned by the worker's dispatcher edit; not bumped here.)
 
     - name: Post result to worker
       env:
