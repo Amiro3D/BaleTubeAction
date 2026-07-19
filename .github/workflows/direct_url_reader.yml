@@ -464,71 +464,146 @@ jobs:
       run: |
         URL="${{ steps.inputs.outputs.url }}"
 
-        # Send images as media group BEFORE posting text to worker
+        # Send images as album BEFORE posting text to worker (user preference: album first).
         IMG_COUNT=$(python3 -c "
-import json
-with open('result.json') as f: d = json.load(f)
-print(len(d.get('images', [])))
-" 2>/dev/null || echo "0")
+          import json
+          with open('result.json') as f: d = json.load(f)
+          print(len(d.get('images', [])))
+        " 2>/dev/null || echo "0")
         echo "Images found: $IMG_COUNT"
 
         if [ "$IMG_COUNT" -gt 0 ] && [ -n "$BALE_BOT_TOKEN" ] && [ -n "$CHAT_ID" ]; then
           API_URL="https://tapi.bale.ai/bot${BALE_BOT_TOKEN}"
           mkdir -p /tmp/url_images
 
-          python3 -c "
-import json, urllib.request
-with open('result.json') as f: d = json.load(f)
-for i, url in enumerate(d.get('images', [])[:10]):
-    try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        data = urllib.request.urlopen(req, timeout=15).read()
-        ext = 'jpg'
-        if '.png' in url.lower(): ext = 'png'
-        elif '.gif' in url.lower(): ext = 'gif'
-        elif '.webp' in url.lower(): ext = 'webp'
-        path = f'/tmp/url_images/photo_{i}.{ext}'
-        with open(path, 'wb') as f: f.write(data)
-        print(f'OK: {path} ({len(data)} bytes)')
-    except Exception as e:
-        print(f'FAIL: {url} - {e}')
-" 2>&1
+          # Page title → caption of the first image. Strip newlines and quote-guard.
+          TITLE=$(python3 -c "
+            import json
+            with open('result.json') as f: d = json.load(f)
+            print((d.get('title') or '').replace('\n',' ').strip()[:1000])
+          " 2>/dev/null || echo "")
 
-          DOWNLOADED=$(ls /tmp/url_images/photo_* 2>/dev/null | wc -l)
-          echo "Downloaded: $DOWNLOADED files"
+          # Download images with curl + browser headers (follow redirects, real UA).
+          # Python urllib.request was blocked by many CDNs and didn't follow redirects.
+          IDX=0
+          python3 -c "
+            import json
+            with open('result.json') as f: d = json.load(f)
+            for u in d.get('images', [])[:10]:
+                print(u)
+          " 2>/dev/null | while IFS= read -r IMG_URL; do
+            [ -z "$IMG_URL" ] && continue
+            # Pick a tentative extension from the URL so we have a stable tmp name;
+            # we will overwrite it after mime-sniffing the downloaded bytes.
+            case "$IMG_URL" in
+              *.png*)  TENTATIVE="png";;
+              *.gif*)  TENTATIVE="gif";;
+              *.webp*) TENTATIVE="webp";;
+              *.svg*)  TENTATIVE="svg";;
+              *)       TENTATIVE="jpg";;
+            esac
+            TMP="/tmp/url_images/photo_${IDX}.tmp"
+            if curl -fsSL --max-time 20 \
+                 -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" \
+                 -H "Accept-Language: en-US,en;q=0.9" \
+                 -H "Referer: $URL" \
+                 -o "$TMP" "$IMG_URL" 2>/dev/null; then
+              # Validate it's actually an image (>1KB and sniffed mime is image/*)
+              if [ -s "$TMP" ]; then
+                MIME=$(file --mime-type -b "$TMP" 2>/dev/null || echo "")
+                case "$MIME" in
+                  image/png)  EXT="png";;
+                  image/jpeg) EXT="jpg";;
+                  image/webp) EXT="webp";;
+                  image/gif)  EXT="gif";;
+                  image/svg+xml) EXT="svg";;
+                  *) EXT="${TENTATIVE}";;
+                esac
+                mv -f "$TMP" "/tmp/url_images/photo_${IDX}.${EXT}"
+                echo "OK: photo_${IDX}.${EXT} ($(stat -c%s "/tmp/url_images/photo_${IDX}.${EXT}" 2>/dev/null) bytes)"
+                IDX=$((IDX + 1))
+              else
+                rm -f "$TMP"
+              fi
+            else
+              echo "FAIL: $IMG_URL"
+              rm -f "$TMP"
+            fi
+            # Keep at most 10 successfully-downloaded images
+            [ "$IDX" -ge 10 ] && break
+          done
+
+          DOWNLOADED=$(ls /tmp/url_images/photo_*.* 2>/dev/null | wc -l)
+          echo "Downloaded: $DOWNLOADED image(s)"
 
           if [ "$DOWNLOADED" -gt 0 ]; then
+            # Build the media JSON array for sendMediaGroup with attach:// references.
+            # First image carries the page title as its caption.
             MEDIA="["
-            for i in $(seq 0 $((DOWNLOADED - 1))); do
-              if [ $i -gt 0 ]; then MEDIA="$MEDIA,"; fi
-              MEDIA="$MEDIA{\"type\":\"photo\",\"media\":\"attach://p$i\"}"
+            I=0
+            for FILE in /tmp/url_images/photo_*.*; do
+              [ -f "$FILE" ] || continue
+              if [ "$I" -gt 0 ]; then MEDIA="${MEDIA},"; fi
+              if [ "$I" -eq 0 ] && [ -n "$TITLE" ]; then
+                # Escape double quotes and backslashes for JSON
+                ESC_TITLE=$(printf '%s' "$TITLE" | sed 's/\\/\\\\/g; s/"/\\"/g' | head -c 1000)
+                MEDIA="${MEDIA}{\"type\":\"photo\",\"media\":\"attach://p${I}\",\"caption\":\"${ESC_TITLE}\"}"
+              else
+                MEDIA="${MEDIA}{\"type\":\"photo\",\"media\":\"attach://p${I}\"}"
+              fi
+              I=$((I + 1))
             done
-            MEDIA="$MEDIA]"
+            MEDIA="${MEDIA}]"
 
             CURL_ARGS=(-F "chat_id=$CHAT_ID" -F "media=$MEDIA")
-            for i in $(seq 0 $((DOWNLOADED - 1))); do
-              FILE=$(ls /tmp/url_images/photo_${i}.* 2>/dev/null | head -1)
-              if [ -n "$FILE" ]; then
-                CURL_ARGS+=(-F "p$i=@${FILE}")
-              fi
+            I=0
+            for FILE in /tmp/url_images/photo_*.*; do
+              [ -f "$FILE" ] || continue
+              CURL_ARGS+=(-F "p${I}=@${FILE}")
+              I=$((I + 1))
             done
 
-            echo "Sending $DOWNLOADED images as media group..."
-            RESP=$(curl -s -X POST "${API_URL}/sendMediaGroup" "${CURL_ARGS[@]}" 2>&1)
-            echo "Response: $(echo "$RESP" | head -c 500)"
+            echo "Sending ${DOWNLOADED} image(s) as media group..."
+            RESP=$(curl -s -w "\n%{http_code}" -X POST "${API_URL}/sendMediaGroup" "${CURL_ARGS[@]}" 2>&1)
+            HTTP_CODE=$(echo "$RESP" | tail -n 1)
+            BODY=$(echo "$RESP" | head -n -1)
+            echo "sendMediaGroup HTTP=${HTTP_CODE} body=$(printf '%s' "$BODY" | head -c 500)"
+
+            # Fallback: if sendMediaGroup failed, send each image individually via sendPhoto.
+            if [ "$HTTP_CODE" != "200" ] || ! echo "$BODY" | grep -q '"message_id"'; then
+              echo "sendMediaGroup did not return a message_id — falling back to individual sendPhoto..."
+              I=0
+              for FILE in /tmp/url_images/photo_*.*; do
+                [ -f "$FILE" ] || continue
+                if [ "$I" -eq 0 ] && [ -n "$TITLE" ]; then
+                  CAP="$TITLE"
+                  [ ${#CAP} -gt 1000 ] && CAP="${CAP:0:1000}..."
+                else
+                  CAP=""
+                fi
+                PH_RESP=$(curl -s -X POST "${API_URL}/sendPhoto" \
+                  -F chat_id="$CHAT_ID" \
+                  -F "photo=@${FILE}" \
+                  -F "caption=${CAP}" 2>&1)
+                echo "sendPhoto[$I] : $(printf '%s' "$PH_RESP" | head -c 300)"
+                I=$((I + 1))
+                # Small delay to avoid rate-limiting
+                sleep 1
+              done
+            fi
           fi
           rm -rf /tmp/url_images
         fi
 
         # Post text + buttons to worker
         MERGED=$(python3 -c "
-import sys, json
-with open('result.json') as f: d = json.load(f)
-d['chat_id'] = '$CHAT_ID'
-d['progress_msg_id'] = '$PROGRESS_MSG_ID'
-d['images'] = []
-print(json.dumps(d))
-" 2>/dev/null || echo "{}")
+          import sys, json
+          with open('result.json') as f: d = json.load(f)
+          d['chat_id'] = '$CHAT_ID'
+          d['progress_msg_id'] = '$PROGRESS_MSG_ID'
+          d['images'] = []
+          print(json.dumps(d))
+        " 2>/dev/null || echo "{}")
         echo "Posting result to worker..."
         RESP=$(curl -s -w "\n%{http_code}" -X POST "${WORKER_URL}/url-result" \
           -H "Content-Type: application/json" \
