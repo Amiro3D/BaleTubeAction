@@ -157,32 +157,25 @@ jobs:
                 await ctx.add_init_script(STEALTH_JS)
                 page = await ctx.new_page()
 
-                # 1. Mint userKey. Strategy (the canonical eeemoon recipe,
-                # confirmed against the most popular PyPI Perchance wrapper):
-                #   a) Warm up Cloudflare by visiting the apex perchance.org
-                #      page so the cf_clearance / __cf_bm cookies get written
-                #      for .perchance.org.  Apex navigation is the lightest
-                #      CF challenge; once cookies are in the jar they ride
-                #      along on the next goto to the API subdomain.
-                #   b) Navigate directly to
-                #      https://image-generation.perchance.org/api/verifyUser
-                #      ?thread=0&__cacheBust=<random>  and regex-scrape the
-                #      "userKey":"([a-f0-9]{64})" string out of the HTML body.
+                # 1. Mint userKey. The core problem is that page.goto()
+                # triggers a fresh Cloudflare JS challenge on EVERY new URL —
+                # even subpaths of a domain we've already cleared.  The fix is
+                # to use page.request.get() instead, which reuses the browser
+                # context's existing cookie jar (including cf_clearance set
+                # during warmup) without creating a new page load.
                 #
-                # We deliberately do NOT scrape window.__USER_DATA__ from the
-                # top-level page — that object lives inside the cross-origin
-                # image-generation.perchance.org iframe, so it never appears
-                # on perchance.org's window.  The direct /api/verifyUser call
-                # is the proven path used by every working wrapper.
+                # Strategy:
+                #   a) page.goto("https://perchance.org/ai-text-to-image-generator")
+                #      — clears CF on perchance.org AND sets cookies for
+                #      .perchance.org (the subdomain's cookies ride along).
+                #   b) page.request.get(API + "/verifyUser?thread=0&__cacheBust=<rand>")
+                #      — sends existing CF cookies via Playwright's
+                #      APIRequestContext; no new page load, no new challenge.
+                #   c) Regex "userKey":"([a-f0-9]{64})" from the response text.
                 user_key = None
                 last_diag = ""
 
                 async def _wait_cf_clear(timeout_s=30):
-                    """If Cloudflare's 'Just a moment...' interstitial is the
-                    current document, poll until it either clears (the title
-                    stops being 'Just a moment...' and the body no longer
-                    contains 'cf-mitigated') or the timeout elapses.  Returns
-                    silently either way; the caller re-reads page state after."""
                     try:
                         await page.wait_for_function(
                             "() => document.title !== 'Just a moment...' "
@@ -192,76 +185,96 @@ jobs:
                     except Exception:
                         pass
 
-                async def warmup_cf():
-                    """Visit perchance.org apex so Cloudflare sets cookies
-                    for .perchance.org.  Apex navigation is the lightest CF
-                    challenge; cookies established here travel to the
-                    image-generation subdomain on the next goto."""
-                    nonlocal last_diag
+                # Warmup: visit the human-facing Perchance page so CF sets
+                # cf_clearance / __cf_bm cookies for .perchance.org.  The
+                # page itself is irrelevant — we just need the cookies.
+                try:
+                    await page.goto(
+                        "https://perchance.org/ai-text-to-image-generator",
+                        wait_until="domcontentloaded",
+                        timeout=45000,
+                    )
+                    await _wait_cf_clear(timeout_s=30)
+                    await page.wait_for_timeout(2500)
                     try:
-                        await page.goto("https://perchance.org",
-                                        wait_until="domcontentloaded",
-                                        timeout=45000)
-                        await _wait_cf_clear(timeout_s=30)
-                        # Give the silent Turnstile a moment to finish
-                        # writing cookies even after the title flips.
-                        await page.wait_for_timeout(2500)
-                        try:
-                            title = await page.title()
-                        except Exception:
-                            title = "<no title>"
-                        last_diag += f"warmup title={title!r}; "
-                    except Exception as e:
-                        last_diag += f"warmup err={e}; "
+                        title = await page.title()
+                    except Exception:
+                        title = "<no title>"
+                    last_diag += f"warmup title={title!r}; "
+                except Exception as e:
+                    last_diag += f"warmup err={e}; "
 
-                async def try_mint_via_verifyuser():
-                    """Hit /api/verifyUser directly and regex out userKey."""
-                    nonlocal last_diag
-                    for attempt in range(3):
+                # Mint: use page.request.get() to fetch verifyUser from the
+                # ALREADY-LOADED page context.  No new page.goto() means no
+                # fresh CF challenge — the existing cookies travel along.
+                for mint_attempt in range(3):
+                    cache_bust = random.random()
+                    verify_url = f"{API}/verifyUser?thread=0&__cacheBust={cache_bust}"
+                    try:
+                        resp = await page.request.get(
+                            verify_url,
+                            timeout=30000,
+                        )
+                        body_text = await resp.text()
+                        if "too_many_requests" in body_text:
+                            user_key = None
+                            last_diag += f"mint-attempt{mint_attempt} RATE_LIMIT; "
+                            break
+                        m = re.search(r'"userKey":"([a-f0-9]{64})"', body_text)
+                        if m:
+                            user_key = m.group(1)
+                            last_diag += f"mint-attempt{mint_attempt} OK; "
+                            break
+                        last_diag += (
+                            f"mint-attempt{mint_attempt} "
+                            f"status={resp.status} "
+                            f"bodylen={len(body_text)} "
+                            f"snippet={body_text[:200]!r}; "
+                        )
+                    except Exception as e:
+                        last_diag += f"mint-attempt{mint_attempt} err={e}; "
+                    await page.wait_for_timeout(2000)
+
+                if not user_key:
+                    # Fallback: try page.goto() directly on verifyUser — this
+                    # might work if the warmup cookies carry despite the fresh
+                    # challenge (Turnstile sometimes auto-passes on retries).
+                    print(f"page.request mint failed, trying goto fallback. diag={last_diag}", file=sys.stderr)
+                    for goto_attempt in range(3):
                         cache_bust = random.random()
                         verify_url = f"{API}/verifyUser?thread=0&__cacheBust={cache_bust}"
                         try:
                             await page.goto(verify_url,
                                             wait_until="domcontentloaded",
                                             timeout=45000)
-                            # The verifyUser URL itself returns the userKey
-                            # once CF clears; wait for the 'Just a moment...'
-                            # interstitial to resolve, then read the body.
                             await _wait_cf_clear(timeout_s=30)
                             content = await page.content()
                             if "too_many_requests" in content:
-                                return ("RATE_LIMIT", None)
+                                print(f"mint: rate-limited (goto fallback). diag={last_diag}", file=sys.stderr)
+                                await browser.close()
+                                print("ERROR:RATE_LIMIT")
+                                return
                             m = re.search(r'"userKey":"([a-f0-9]{64})"', content)
                             if m:
-                                return (None, m.group(1))
+                                user_key = m.group(1)
+                                last_diag += f"goto-attempt{goto_attempt} OK; "
+                                break
                             try:
                                 title = await page.title()
                             except Exception:
                                 title = "<no title>"
                             last_diag += (
-                                f"verify-attempt{attempt} "
+                                f"goto-attempt{goto_attempt} "
                                 f"title={title!r} "
                                 f"bodylen={len(content)} "
                                 f"snippet={content[:200]!r}; "
                             )
                         except Exception as e:
-                            last_diag += f"verify-attempt{attempt} err={e}; "
+                            last_diag += f"goto-attempt{goto_attempt} err={e}; "
                         await page.wait_for_timeout(2500)
-                    return (None, None)
 
-                # Step a: warm up CF on the apex domain.
-                await warmup_cf()
-                # Step b: mint via the direct verifyUser endpoint.
-                err, key = await try_mint_via_verifyuser()
-                if err == "RATE_LIMIT":
-                    print(f"mint: rate-limited. diag={last_diag}", file=sys.stderr)
-                    await browser.close()
-                    print("ERROR:RATE_LIMIT")
-                    return
-                if key:
-                    user_key = key
-                else:
-                    print(f"mint failed: cf challenge. diag={last_diag}", file=sys.stderr)
+                if not user_key:
+                    print(f"mint failed: all methods exhausted. diag={last_diag}", file=sys.stderr)
                     await browser.close()
                     print("ERROR:CF_CHALLENGE")
                     return
