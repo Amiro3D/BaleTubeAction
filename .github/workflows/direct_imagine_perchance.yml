@@ -223,9 +223,12 @@ jobs:
                                 # Check if CF challenge is still showing
                                 is_cf = await frame.evaluate("() => document.documentElement.innerHTML.includes('cf-mitigated') || document.title === 'Just a moment...'")
                                 last_diag += f"frame-cf={is_cf}; "
-                                key = await frame.evaluate(
-                                    "() => (window.__USER_DATA__ && window.__USER_DATA__.userKey) ? window.__USER_DATA__.userKey : null"
-                                )
+                                # Call verifyUser FROM WITHIN the iframe
+                                # using fetch(). The iframe is on
+                                # *.perchance.org so fetch to
+                                # image-generation.perchance.org sends
+                                # same-site cookies.
+                                key = await frame.evaluate('async () => { try { const r = await fetch("https://image-generation.perchance.org/api/verifyUser?thread=0&__cacheBust=" + Math.random()); const t = await r.text(); const m = t.match(/"userKey":"([a-f0-9]{64})"/); return m ? m[1] : null; } catch(e) { return null; } }')
                                 if key and re.fullmatch(r"[a-f0-9]{64}", str(key)):
                                     user_key = str(key)
                                     last_diag += f"frame-attempt{frame_attempt} OK; "
