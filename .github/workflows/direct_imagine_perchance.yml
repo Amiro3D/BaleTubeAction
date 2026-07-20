@@ -201,19 +201,21 @@ jobs:
                 except Exception as e:
                     last_diag += f"warmup err={e}; "
 
-                # DEBUG: log all frame URLs so we can see what the page loaded.
-                for fi, fr in enumerate(page.frames):
-                    last_diag += f"frame[{fi}]={fr.url[:120]!r}; "
-
-                # Step 2: find the iframe and extract __USER_DATA__.  The
-                # iframe loads image-generation.perchance.org.  Playwright's
-                # page.frames includes cross-origin frames — we match by URL
-                # pattern and then evaluate JS inside the frame context.
-                IFRA = "image-generation.perchance.org"
+                # Step 2: find the image-generator iframe and extract
+                # __USER_DATA__.  The perchance.org page embeds the generator
+                # inside an iframe on a HASHED subdomain (e.g.
+                # cd282495464c4f81bf84e2ef3974e6f6.perchance.org), NOT on
+                # image-generation.perchance.org.  We identify the iframe as
+                # any frame whose URL is a perchance.org subdomain but NOT
+                # the main page itself.
+                MAIN_URL = page.url
                 for frame_attempt in range(10):
                     for frame in page.frames:
-                        if IFRA in frame.url:
-                            last_diag += f"frame-found url={frame.url[:80]!r}; "
+                        furl = frame.url
+                        if (furl and furl != MAIN_URL
+                            and furl != "about:blank"
+                            and "perchance.org" in furl):
+                            last_diag += f"frame-found url={furl[:100]!r}; "
                             try:
                                 key = await frame.evaluate(
                                     "() => (window.__USER_DATA__ && window.__USER_DATA__.userKey) ? window.__USER_DATA__.userKey : null"
