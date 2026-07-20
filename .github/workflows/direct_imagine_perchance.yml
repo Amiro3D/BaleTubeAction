@@ -233,23 +233,36 @@ jobs:
                                 # trusted *.perchance.org subdomain with
                                 # CF cookies — navigating within it may
                                 # carry CF trust to the target.
-                                vu = f'{API}/verifyUser?thread=0&__cacheBust={random.random()}'
+                                # Try same-origin proxy on perchance.org.
+                                # The real generator page calls verifyUser
+                                # through perchance.org's own server, not
+                                # directly to image-generation.perchance.org.
                                 try:
-                                    await frame.goto(vu, wait_until='domcontentloaded', timeout=30000)
-                                    await _wait_cf_clear(timeout_s=20)
-                                    frame_content = await frame.content()
-                                    m = re.search(r'"userKey":"([a-f0-9]{64})"', frame_content)
-                                    if m:
-                                        key = m.group(1)
+                                    proxy_key = await page.evaluate('''
+                                        async () => {
+                                            const urls = [
+                                                '/api/verifyUser?thread=0&__cacheBust=' + Math.random(),
+                                                'https://perchance.org/api/verifyUser?thread=0&__cacheBust=' + Math.random()
+                                            ];
+                                            for (const u of urls) {
+                                                try {
+                                                    const r = await fetch(u);
+                                                    const t = await r.text();
+                                                    const m = t.match(/"userKey":"([a-f0-9]{64})"/);
+                                                    if (m) return m[1];
+                                                } catch(e) {}
+                                            }
+                                            return null;
+                                        }
+                                    ''')
+                                    if proxy_key and re.fullmatch(r"[a-f0-9]{64}", str(proxy_key)):
+                                        key = str(proxy_key)
+                                        last_diag += f"frame-attempt{frame_attempt} proxy-OK; "
                                     else:
-                                        try:
-                                            ft = await frame.title()
-                                        except Exception:
-                                            ft = '<no title>'
-                                        last_diag += f'frame-goto-title={ft!r} bodylen={len(frame_content)}; '
+                                        last_diag += f"frame-attempt{frame_attempt} proxy-null; "
                                         key = None
                                 except Exception as e:
-                                    last_diag += f'frame-goto-err={e!r}; '
+                                    last_diag += f"frame-attempt{frame_attempt} proxy-err={e!r}; "
                                     key = None
                                 if key and re.fullmatch(r"[a-f0-9]{64}", str(key)):
                                     user_key = str(key)
