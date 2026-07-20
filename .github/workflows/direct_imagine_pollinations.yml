@@ -18,7 +18,7 @@ jobs:
       - name: Generate and send image
         env:
           PROMPT: ${{ github.event.client_payload.prompt }}
-          MODEL: ${{ github.event.client_payload.model || 'flux' }}
+          MODEL: ${{ github.event.client_payload.model || 'flux-pro' }}
           CHAT_ID: ${{ github.event.client_payload.chat_id }}
           MSG_ID: ${{ github.event.client_payload.msg_id || '' }}
           GROUP_CHAT_ID: ${{ github.event.client_payload.group_chat_id || '' }}
