@@ -228,7 +228,29 @@ jobs:
                                 # *.perchance.org so fetch to
                                 # image-generation.perchance.org sends
                                 # same-site cookies.
-                                key = await frame.evaluate('async () => { try { const r = await fetch("https://image-generation.perchance.org/api/verifyUser?thread=0&__cacheBust=" + Math.random()); const t = await r.text(); const m = t.match(/"userKey":"([a-f0-9]{64})"/); return m ? m[1] : null; } catch(e) { return null; } }')
+                                # Navigate the iframe TO the verifyUser
+                                # endpoint. The iframe is already on a
+                                # trusted *.perchance.org subdomain with
+                                # CF cookies — navigating within it may
+                                # carry CF trust to the target.
+                                vu = f'{API}/verifyUser?thread=0&__cacheBust={random.random()}'
+                                try:
+                                    await frame.goto(vu, wait_until='domcontentloaded', timeout=30000)
+                                    await _wait_cf_clear(timeout_s=20)
+                                    frame_content = await frame.content()
+                                    m = re.search(r'"userKey":"([a-f0-9]{64})"', frame_content)
+                                    if m:
+                                        key = m.group(1)
+                                    else:
+                                        try:
+                                            ft = await frame.title()
+                                        except Exception:
+                                            ft = '<no title>'
+                                        last_diag += f'frame-goto-title={ft!r} bodylen={len(frame_content)}; '
+                                        key = None
+                                except Exception as e:
+                                    last_diag += f'frame-goto-err={e!r}; '
+                                    key = None
                                 if key and re.fullmatch(r"[a-f0-9]{64}", str(key)):
                                     user_key = str(key)
                                     last_diag += f"frame-attempt{frame_attempt} OK; "
