@@ -1,0 +1,168 @@
+name: AI Ask (OpenCode Zen)
+
+on:
+  repository_dispatch:
+    types: [bale_ask]
+
+jobs:
+  ask:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+    - name: Ask OpenCode Zen and reply in Bale
+      env:
+        BALE_BOT_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
+        OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+        QUESTION: ${{ github.event.client_payload.question }}
+        CHAT_ID: ${{ github.event.client_payload.chat_id }}
+        MSG_ID: ${{ github.event.client_payload.msg_id || '' }}
+        GROUP_CHAT_ID: ${{ github.event.client_payload.group_chat_id || '' }}
+      run: |
+        set +e
+        API="https://tapi.bale.ai/bot${BALE_BOT_TOKEN}"
+
+        # send_with_retry: POST a Bale API method with multipart curl args,
+        # retrying on 429 (honoring retry_after) and 5xx. Returns last body.
+        send_with_retry() {
+          local API_URL="$1"; shift
+          local MAX_RETRIES=5
+          local RESP ERROR_CODE RETRY_AFTER
+          for i in $(seq 1 $MAX_RETRIES); do
+            RESP=$(curl -s -X POST "$API_URL" "$@")
+            ERROR_CODE=$(printf '%s' "$RESP" | grep -o '"error_code":[0-9]*' | head -1 | cut -d: -f2)
+            if [ "$ERROR_CODE" = "429" ]; then
+              RETRY_AFTER=$(printf '%s' "$RESP" | grep -o '"retry_after":[0-9]*' | head -1 | cut -d: -f2)
+              RETRY_AFTER=${RETRY_AFTER:-5}
+              echo "send_with_retry: 429. Sleeping ${RETRY_AFTER}s (attempt $i/$MAX_RETRIES)" >&2
+              sleep $((RETRY_AFTER + 2))
+              continue
+            fi
+            if [ -n "$ERROR_CODE" ] && [ "$ERROR_CODE" -ge 500 ] 2>/dev/null; then
+              echo "send_with_retry: Bale error_code=$ERROR_CODE (attempt $i/$MAX_RETRIES)" >&2
+              sleep "$i"
+              continue
+            fi
+            printf '%s' "$RESP"
+            return 0
+          done
+          printf '%s' "$RESP"
+        }
+
+        # notify_user: delete the in-chat progress message and send a Persian
+        # error text. Used on every failure path.
+        notify_user() {
+          local TEXT="$1"
+          if [ -n "$MSG_ID" ]; then
+            curl -s -X POST "$API/deleteMessage" -F "chat_id=$CHAT_ID" -F "message_id=$MSG_ID" > /dev/null 2>&1 || true
+          fi
+          send_with_retry "$API/sendMessage" -F "chat_id=$CHAT_ID" -F "text=$TEXT" > /dev/null || true
+        }
+
+        # Build the JSON request body in a temp file so that the user's
+        # question (which may contain quotes, newlines, emojis) survives the
+        # shell -> curl pipe unscathed. jq is available on ubuntu-latest.
+        SYS_PROMPT='You are a concise, helpful assistant. Answer in the same language the user wrote in. Keep replies short unless asked for detail. Do not preface the answer with reasoning or headers — output the final answer directly.'
+
+        python3 - "$QUESTION" "$SYS_PROMPT" << 'PYEOF' > /tmp/ask_body.json
+        import json, sys
+        q = sys.argv[1]
+        sys_prompt = sys.argv[2]
+        body = {
+            "model": "mimo-v2.5-free",
+            "messages": [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": q},
+            ],
+            "temperature": 0.7,
+            "max_tokens": 1024,
+        }
+        print(json.dumps(body, ensure_ascii=False))
+        PYEOF
+
+        if [ ! -s /tmp/ask_body.json ]; then
+          notify_user "❌ ساخت درخواست به هوش مصنوعی ناموفق بود. دوباره امتحان کن."
+          exit 0
+        fi
+
+        # Call OpenCode Zen from the Ubuntu runner. Retry up to 4 times with
+        # exponential backoff on 429/5xx — the runner IP is residential-class
+        # so a 429 here is almost always a transient windowed throttle.
+        AI_URL='https://opencode.ai/zen/v1/chat/completions'
+        AI_RESP_FILE=/tmp/ask_resp.json
+        AI_HTTP=0
+        for attempt in 1 2 3 4; do
+          AI_HTTP=$(curl -s -o "$AI_RESP_FILE" -w "%{http_code}" --max-time 40 \
+            -X POST "$AI_URL" \
+            -H "Authorization: Bearer ${OPENCODE_API_KEY}" \
+            -H "Content-Type: application/json" \
+            --data-binary "@/tmp/ask_body.json")
+          if [ "$AI_HTTP" = "200" ]; then break; fi
+          echo "ask: HTTP $AI_HTTP on attempt $attempt, backing off" >&2
+          if [ "$attempt" = "4" ]; then break; fi
+          sleep $((1 << attempt))   # 2, 4, 8s
+        done
+
+        if [ "$AI_HTTP" != "200" ] || [ ! -s "$AI_RESP_FILE" ]; then
+          ERR=$(python3 -c "import json,sys; d=json.load(open('$AI_RESP_FILE')); print((d.get('error') or {}).get('message','') if isinstance(d.get('error'),dict) else d.get('error','') or 'HTTP $AI_HTTP')" 2>/dev/null || echo "HTTP $AI_HTTP")
+          notify_user "❌ خطا در ارتباط با هوش مصنوعی: ${ERR}"
+          exit 0
+        fi
+
+        # Extract the answer from the response. mimo-v2.5-free returns
+        # `message.content` (the final answer) and a separate `reasoning`
+        # field (its chain-of-thought) — we deliberately ignore `reasoning`.
+        ANSWER=$(python3 - "$AI_RESP_FILE" << 'PYEOF'
+        import json, re, sys
+        d = json.load(open(sys.argv[1]))
+        if not d.get('choices'):
+            print('', end='')
+            sys.exit(0)
+        raw = (d['choices'][0].get('message', {}) or {}).get('content', '') or ''
+        raw = raw.strip()
+        # Defensive: if the model still emits "**Reasoning...**\n\n**Answer**\n\n<final>",
+        # strip everything up to the last **Answer** header so the chat only
+        # sees the final answer.
+        hdr = raw.rfind('**Answer**')
+        if hdr != -1 and re.search(r'\*\*Reasoning|Reasoning and information|Reasoning used', raw[:hdr], re.IGNORECASE):
+            raw = raw[hdr + len('**Answer**'):].strip()
+        print(raw, end='')
+        PYEOF
+        )
+
+        if [ -z "$ANSWER" ]; then
+          notify_user "❌ پاسخ خالی از هوش مصنوعی. دوباره امتحان کن."
+          exit 0
+        fi
+
+        # Prefix the answer with the bot emoji and post it. We want a single
+        # tidy message rather than a "thinking..." + "answer" pair, so we
+        # try to EDIT the progress message first; if that fails (e.g. the
+        # user deleted it) we fall back to a fresh sendMessage.
+        FULL_TEXT="🤖 ${ANSWER}"
+        EDITED_OK=0
+        if [ -n "$MSG_ID" ]; then
+          EDIT_RESP=$(send_with_retry "$API/editMessageText" \
+            -F "chat_id=$CHAT_ID" \
+            -F "message_id=$MSG_ID" \
+            -F "text=$FULL_TEXT")
+          if echo "$EDIT_RESP" | grep -q '"ok":true'; then
+            EDITED_OK=1
+          fi
+        fi
+        if [ "$EDITED_OK" = "0" ]; then
+          # Edit failed or no progress message — send a fresh message, and
+          # delete the progress placeholder if it still exists.
+          if [ -n "$MSG_ID" ]; then
+            curl -s -X POST "$API/deleteMessage" -F "chat_id=$CHAT_ID" -F "message_id=$MSG_ID" > /dev/null 2>&1 || true
+          fi
+          send_with_retry "$API/sendMessage" -F "chat_id=$CHAT_ID" -F "text=$FULL_TEXT" > /dev/null || true
+        fi
+
+        # Optional group chat fan-out.
+        if [ -n "$GROUP_CHAT_ID" ] && [ "$GROUP_CHAT_ID" != "0" ]; then
+          GROUP_TEXT=$(printf '🤖 AI Answer\n\n%s' "$ANSWER")
+          send_with_retry "$API/sendMessage" -F "chat_id=$GROUP_CHAT_ID" -F "text=$GROUP_TEXT" > /dev/null || true
+        fi
+
+        rm -f /tmp/ask_body.json /tmp/ask_resp.json
+        exit 0
