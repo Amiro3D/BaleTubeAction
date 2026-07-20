@@ -27,8 +27,16 @@ jobs:
         run: |
           set -euo pipefail
 
-          # URL-encode prompt for curl
-          ENCODED=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$PROMPT")
+          # Write prompt to file to avoid bash quoting issues with special chars
+          printf '%s' "$PROMPT" > /tmp/prompt.txt
+
+          # URL-encode prompt (truncate to 500 chars to avoid URL length issues)
+          ENCODED=$(python3 -c "
+          import urllib.parse
+          with open('/tmp/prompt.txt') as f:
+              p = f.read().strip()[:500]
+          print(urllib.parse.quote(p))
+          ")
 
           # Random seed for variety
           SEED=$((RANDOM))
@@ -41,80 +49,81 @@ jobs:
 
           if [ "$HTTP_CODE" != "200" ] || [ ! -s "$OUTFILE" ]; then
             echo "ERROR: Pollinations returned HTTP $HTTP_CODE"
-            python3 -c "
-          import urllib.request, urllib.parse
-          token = '${BALE_BOT_TOKEN}'
-          chat_id = '${CHAT_ID}'
+            python3 << 'PYEOF'
+          import urllib.request, urllib.parse, os
+          token = os.environ['BALE_BOT_TOKEN']
+          chat_id = os.environ['CHAT_ID']
           msg = '❌ خطا در ساخت تصویر. بعداً امتحان کن.'
           url = f'https://tapi.bale.ai/bot{token}/sendMessage'
           data = urllib.parse.urlencode({'chat_id': chat_id, 'text': msg}).encode()
           urllib.request.urlopen(url, data=data, timeout=15)
-          "
+          PYEOF
             # Delete progress message
             if [ -n "${MSG_ID}" ]; then
-              python3 -c "
-          import urllib.request, urllib.parse
-          token = '${BALE_BOT_TOKEN}'
+              python3 << 'PYEOF'
+          import urllib.request, urllib.parse, os
+          token = os.environ['BALE_BOT_TOKEN']
           url = f'https://tapi.bale.ai/bot{token}/deleteMessage'
-          data = urllib.parse.urlencode({'chat_id': '${CHAT_ID}', 'message_id': '${MSG_ID}'}).encode()
+          data = urllib.parse.urlencode({'chat_id': os.environ['CHAT_ID'], 'message_id': os.environ['MSG_ID']}).encode()
           urllib.request.urlopen(url, data=data, timeout=15)
-          " 2>/dev/null || true
+          PYEOF
             fi
             exit 0
           fi
 
-          # Verify file is a valid image (JPEG starts with FF D8)
+          # Verify file is a valid image
           FILE_SIZE=$(stat -c%s "$OUTFILE" 2>/dev/null || stat -f%z "$OUTFILE" 2>/dev/null || echo 0)
           if [ "$FILE_SIZE" -lt 5000 ]; then
-            echo "ERROR: Image too small (${FILE_SIZE} bytes), likely error response"
-            python3 -c "
-          import urllib.request, urllib.parse
-          token = '${BALE_BOT_TOKEN}'
-          chat_id = '${CHAT_ID}'
+            echo "ERROR: Image too small (${FILE_SIZE} bytes)"
+            python3 << 'PYEOF'
+          import urllib.request, urllib.parse, os
+          token = os.environ['BALE_BOT_TOKEN']
+          chat_id = os.environ['CHAT_ID']
           msg = '❌ تصویر تولید شده خیلی کوچک بود. دوباره امتحان کن.'
           url = f'https://tapi.bale.ai/bot{token}/sendMessage'
           data = urllib.parse.urlencode({'chat_id': chat_id, 'text': msg}).encode()
           urllib.request.urlopen(url, data=data, timeout=15)
-          "
+          PYEOF
             if [ -n "${MSG_ID}" ]; then
-              python3 -c "
-          import urllib.request, urllib.parse
-          token = '${BALE_BOT_TOKEN}'
+              python3 << 'PYEOF'
+          import urllib.request, urllib.parse, os
+          token = os.environ['BALE_BOT_TOKEN']
           url = f'https://tapi.bale.ai/bot{token}/deleteMessage'
-          data = urllib.parse.urlencode({'chat_id': '${CHAT_ID}', 'message_id': '${MSG_ID}'}).encode()
+          data = urllib.parse.urlencode({'chat_id': os.environ['CHAT_ID'], 'message_id': os.environ['MSG_ID']}).encode()
           urllib.request.urlopen(url, data=data, timeout=15)
-          " 2>/dev/null || true
+          PYEOF
             fi
             exit 0
           fi
 
           echo "Image downloaded: ${FILE_SIZE} bytes"
 
-          # Send photo to Bale
-          CAPTION="✨ «${PROMPT}»"
-          SEND_RESULT=$(python3 -c "
-          import urllib.request, urllib.parse, json, sys, io, mimetypes
+          # Send photo to Bale — read caption from file to avoid quoting issues
+          python3 << 'PYEOF'
+          import urllib.request, urllib.parse, json, io, os
 
-          token = '${BALE_BOT_TOKEN}'
-          chat_id = '${CHAT_ID}'
-          caption = '''${CAPTION}'''
-          img_path = '${OUTFILE}'
+          token = os.environ['BALE_BOT_TOKEN']
+          chat_id = os.environ['CHAT_ID']
+          img_path = '/tmp/ai_image.jpg'
+
+          with open('/tmp/prompt.txt') as f:
+              prompt = f.read().strip()[:200]
+          caption = f'✨ «{prompt}»'
 
           boundary = '----PythonBoundary'
           body = io.BytesIO()
 
           def write_field(name, value):
               body.write(f'--{boundary}\r\n'.encode())
-              body.write(f'Content-Disposition: form-data; name=\"{name}\"\r\n\r\n'.encode())
+              body.write(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode())
               body.write(f'{value}\r\n'.encode())
 
           write_field('chat_id', chat_id)
           write_field('caption', caption)
 
-          # File part
           filename = 'image.jpg'
           body.write(f'--{boundary}\r\n'.encode())
-          body.write(f'Content-Disposition: form-data; name=\"photo\"; filename=\"{filename}\"\r\n'.encode())
+          body.write(f'Content-Disposition: form-data; name="photo"; filename="{filename}"\r\n'.encode())
           body.write(b'Content-Type: image/jpeg\r\n\r\n')
           with open(img_path, 'rb') as f:
               body.write(f.read())
@@ -131,37 +140,38 @@ jobs:
               print(json.dumps(result))
           except Exception as e:
               print(json.dumps({'ok': False, 'error': str(e)}))
-          ")
-
-          echo "Send result: $SEND_RESULT"
+          PYEOF
 
           # Delete the progress message
           if [ -n "${MSG_ID}" ]; then
-            python3 -c "
-          import urllib.request, urllib.parse
-          token = '${BALE_BOT_TOKEN}'
+            python3 << 'PYEOF'
+          import urllib.request, urllib.parse, os
+          token = os.environ['BALE_BOT_TOKEN']
           url = f'https://tapi.bale.ai/bot{token}/deleteMessage'
-          data = urllib.parse.urlencode({'chat_id': '${CHAT_ID}', 'message_id': '${MSG_ID}'}).encode()
+          data = urllib.parse.urlencode({'chat_id': os.environ['CHAT_ID'], 'message_id': os.environ['MSG_ID']}).encode()
           urllib.request.urlopen(url, data=data, timeout=15)
-          " 2>/dev/null || true
+          PYEOF
           fi
 
           # Send to group chat if configured
           if [ -n "${GROUP_CHAT_ID}" ]; then
-            python3 -c "
-          import urllib.request, urllib.parse, json, io
+            python3 << 'PYEOF'
+          import urllib.request, urllib.parse, json, io, os
 
-          token = '${BALE_BOT_TOKEN}'
-          chat_id = '${GROUP_CHAT_ID}'
-          caption = '✨ AI Generated — ${PROMPT}'
-          img_path = '${OUTFILE}'
+          token = os.environ['BALE_BOT_TOKEN']
+          chat_id = os.environ['GROUP_CHAT_ID']
+          img_path = '/tmp/ai_image.jpg'
+
+          with open('/tmp/prompt.txt') as f:
+              prompt = f.read().strip()[:200]
+          caption = f'✨ AI Generated — {prompt}'
 
           boundary = '----PythonBoundary'
           body = io.BytesIO()
 
           def write_field(name, value):
               body.write(f'--{boundary}\r\n'.encode())
-              body.write(f'Content-Disposition: form-data; name=\"{name}\"\r\n\r\n'.encode())
+              body.write(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode())
               body.write(f'{value}\r\n'.encode())
 
           write_field('chat_id', chat_id)
@@ -169,7 +179,7 @@ jobs:
 
           filename = 'image.jpg'
           body.write(f'--{boundary}\r\n'.encode())
-          body.write(f'Content-Disposition: form-data; name=\"photo\"; filename=\"{filename}\"\r\n'.encode())
+          body.write(f'Content-Disposition: form-data; name="photo"; filename="{filename}"\r\n'.encode())
           body.write(b'Content-Type: image/jpeg\r\n\r\n')
           with open(img_path, 'rb') as f:
               body.write(f.read())
@@ -184,7 +194,7 @@ jobs:
               urllib.request.urlopen(req, timeout=30)
           except:
               pass
-          " 2>/dev/null || true
+          PYEOF
           fi
 
           echo "Done."
