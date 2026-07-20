@@ -1,0 +1,189 @@
+# ---------------------------------------------------------------
+# direct_imagine_pollinations.yml
+# Triggered by worker.js dispatch: /imagine <prompt>
+# Uses Pollinations.ai — no API key, no Playwright, no CF challenge.
+# Simple GET request returns JPEG directly.
+# ---------------------------------------------------------------
+
+name: AI Image Generation (Pollinations)
+on:
+  repository_dispatch:
+    types: [bale_imagine]
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Generate and send image
+        env:
+          PROMPT: ${{ github.event.client_payload.prompt }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+          MSG_ID: ${{ github.event.client_payload.msg_id || '' }}
+          GROUP_CHAT_ID: ${{ github.event.client_payload.group_chat_id || '' }}
+          USER_ID: ${{ github.event.client_payload.user_id || '' }}
+          BALE_BOT_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # URL-encode prompt for curl
+          ENCODED=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$PROMPT")
+
+          # Random seed for variety
+          SEED=$((RANDOM))
+
+          IMG_URL="https://image.pollinations.ai/prompt/${ENCODED}?width=768&height=768&nologo=true&seed=${SEED}"
+          OUTFILE="/tmp/ai_image.jpg"
+
+          echo "Downloading image from Pollinations.ai..."
+          HTTP_CODE=$(curl -sL -o "$OUTFILE" -w "%{http_code}" --max-time 90 "$IMG_URL")
+
+          if [ "$HTTP_CODE" != "200" ] || [ ! -s "$OUTFILE" ]; then
+            echo "ERROR: Pollinations returned HTTP $HTTP_CODE"
+            python3 -c "
+          import urllib.request, urllib.parse
+          token = '${BALE_BOT_TOKEN}'
+          chat_id = '${CHAT_ID}'
+          msg = '❌ خطا در ساخت تصویر. بعداً امتحان کن.'
+          url = f'https://tapi.bale.ai/bot{token}/sendMessage'
+          data = urllib.parse.urlencode({'chat_id': chat_id, 'text': msg}).encode()
+          urllib.request.urlopen(url, data=data, timeout=15)
+          "
+            # Delete progress message
+            if [ -n "${MSG_ID}" ]; then
+              python3 -c "
+          import urllib.request, urllib.parse
+          token = '${BALE_BOT_TOKEN}'
+          url = f'https://tapi.bale.ai/bot{token}/deleteMessage'
+          data = urllib.parse.urlencode({'chat_id': '${CHAT_ID}', 'message_id': '${MSG_ID}'}).encode()
+          urllib.request.urlopen(url, data=data, timeout=15)
+          " 2>/dev/null || true
+            fi
+            exit 0
+          fi
+
+          # Verify file is a valid image (JPEG starts with FF D8)
+          FILE_SIZE=$(stat -c%s "$OUTFILE" 2>/dev/null || stat -f%z "$OUTFILE" 2>/dev/null || echo 0)
+          if [ "$FILE_SIZE" -lt 5000 ]; then
+            echo "ERROR: Image too small (${FILE_SIZE} bytes), likely error response"
+            python3 -c "
+          import urllib.request, urllib.parse
+          token = '${BALE_BOT_TOKEN}'
+          chat_id = '${CHAT_ID}'
+          msg = '❌ تصویر تولید شده خیلی کوچک بود. دوباره امتحان کن.'
+          url = f'https://tapi.bale.ai/bot{token}/sendMessage'
+          data = urllib.parse.urlencode({'chat_id': chat_id, 'text': msg}).encode()
+          urllib.request.urlopen(url, data=data, timeout=15)
+          "
+            if [ -n "${MSG_ID}" ]; then
+              python3 -c "
+          import urllib.request, urllib.parse
+          token = '${BALE_BOT_TOKEN}'
+          url = f'https://tapi.bale.ai/bot{token}/deleteMessage'
+          data = urllib.parse.urlencode({'chat_id': '${CHAT_ID}', 'message_id': '${MSG_ID}'}).encode()
+          urllib.request.urlopen(url, data=data, timeout=15)
+          " 2>/dev/null || true
+            fi
+            exit 0
+          fi
+
+          echo "Image downloaded: ${FILE_SIZE} bytes"
+
+          # Send photo to Bale
+          CAPTION="✨ «${PROMPT}»"
+          SEND_RESULT=$(python3 -c "
+          import urllib.request, urllib.parse, json, sys, io, mimetypes
+
+          token = '${BALE_BOT_TOKEN}'
+          chat_id = '${CHAT_ID}'
+          caption = '''${CAPTION}'''
+          img_path = '${OUTFILE}'
+
+          boundary = '----PythonBoundary'
+          body = io.BytesIO()
+
+          def write_field(name, value):
+              body.write(f'--{boundary}\r\n'.encode())
+              body.write(f'Content-Disposition: form-data; name=\"{name}\"\r\n\r\n'.encode())
+              body.write(f'{value}\r\n'.encode())
+
+          write_field('chat_id', chat_id)
+          write_field('caption', caption)
+
+          # File part
+          filename = 'image.jpg'
+          body.write(f'--{boundary}\r\n'.encode())
+          body.write(f'Content-Disposition: form-data; name=\"photo\"; filename=\"{filename}\"\r\n'.encode())
+          body.write(b'Content-Type: image/jpeg\r\n\r\n')
+          with open(img_path, 'rb') as f:
+              body.write(f.read())
+          body.write(b'\r\n')
+
+          body.write(f'--{boundary}--\r\n'.encode())
+
+          url = f'https://tapi.bale.ai/bot{token}/sendPhoto'
+          req = urllib.request.Request(url, data=body.getvalue())
+          req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
+          try:
+              resp = urllib.request.urlopen(req, timeout=30)
+              result = json.loads(resp.read())
+              print(json.dumps(result))
+          except Exception as e:
+              print(json.dumps({'ok': False, 'error': str(e)}))
+          ")
+
+          echo "Send result: $SEND_RESULT"
+
+          # Delete the progress message
+          if [ -n "${MSG_ID}" ]; then
+            python3 -c "
+          import urllib.request, urllib.parse
+          token = '${BALE_BOT_TOKEN}'
+          url = f'https://tapi.bale.ai/bot{token}/deleteMessage'
+          data = urllib.parse.urlencode({'chat_id': '${CHAT_ID}', 'message_id': '${MSG_ID}'}).encode()
+          urllib.request.urlopen(url, data=data, timeout=15)
+          " 2>/dev/null || true
+          fi
+
+          # Send to group chat if configured
+          if [ -n "${GROUP_CHAT_ID}" ]; then
+            python3 -c "
+          import urllib.request, urllib.parse, json, io
+
+          token = '${BALE_BOT_TOKEN}'
+          chat_id = '${GROUP_CHAT_ID}'
+          caption = '✨ AI Generated — ${PROMPT}'
+          img_path = '${OUTFILE}'
+
+          boundary = '----PythonBoundary'
+          body = io.BytesIO()
+
+          def write_field(name, value):
+              body.write(f'--{boundary}\r\n'.encode())
+              body.write(f'Content-Disposition: form-data; name=\"{name}\"\r\n\r\n'.encode())
+              body.write(f'{value}\r\n'.encode())
+
+          write_field('chat_id', chat_id)
+          write_field('caption', caption)
+
+          filename = 'image.jpg'
+          body.write(f'--{boundary}\r\n'.encode())
+          body.write(f'Content-Disposition: form-data; name=\"photo\"; filename=\"{filename}\"\r\n'.encode())
+          body.write(b'Content-Type: image/jpeg\r\n\r\n')
+          with open(img_path, 'rb') as f:
+              body.write(f.read())
+          body.write(b'\r\n')
+
+          body.write(f'--{boundary}--\r\n'.encode())
+
+          url = f'https://tapi.bale.ai/bot{token}/sendPhoto'
+          req = urllib.request.Request(url, data=body.getvalue())
+          req.add_header('Content-Type', f'multipart/form-data; boundary={boundary}')
+          try:
+              urllib.request.urlopen(req, timeout=30)
+          except:
+              pass
+          " 2>/dev/null || true
+          fi
+
+          echo "Done."
