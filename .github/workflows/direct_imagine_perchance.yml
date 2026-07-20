@@ -217,6 +217,12 @@ jobs:
                             and "perchance.org" in furl):
                             last_diag += f"frame-found url={furl[:100]!r}; "
                             try:
+                                # Check iframe state: title tells us if CF cleared
+                                frame_title = await frame.evaluate("() => document.title || '<no title>'")
+                                last_diag += f"frame-title={frame_title!r}; "
+                                # Check if CF challenge is still showing
+                                is_cf = await frame.evaluate("() => document.documentElement.innerHTML.includes('cf-mitigated') || document.title === 'Just a moment...'")
+                                last_diag += f"frame-cf={is_cf}; "
                                 key = await frame.evaluate(
                                     "() => (window.__USER_DATA__ && window.__USER_DATA__.userKey) ? window.__USER_DATA__.userKey : null"
                                 )
