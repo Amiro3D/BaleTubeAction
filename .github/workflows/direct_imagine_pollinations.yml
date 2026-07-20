@@ -18,6 +18,7 @@ jobs:
       - name: Generate and send image
         env:
           PROMPT: ${{ github.event.client_payload.prompt }}
+          MODEL: ${{ github.event.client_payload.model || 'flux' }}
           CHAT_ID: ${{ github.event.client_payload.chat_id }}
           MSG_ID: ${{ github.event.client_payload.msg_id || '' }}
           GROUP_CHAT_ID: ${{ github.event.client_payload.group_chat_id || '' }}
@@ -32,7 +33,7 @@ jobs:
           # Random seed for variety
           SEED=$((RANDOM))
 
-          IMG_URL="https://image.pollinations.ai/prompt/${ENCODED}?width=768&height=768&nologo=true&seed=${SEED}"
+          IMG_URL="https://image.pollinations.ai/prompt/${ENCODED}?width=768&height=768&nologo=true&seed=${SEED}&model=${MODEL}"
           OUTFILE="/tmp/ai_image.jpg"
 
           echo "Downloading image from Pollinations.ai..."
