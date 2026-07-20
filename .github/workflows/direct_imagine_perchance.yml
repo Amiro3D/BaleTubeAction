@@ -157,21 +157,14 @@ jobs:
                 await ctx.add_init_script(STEALTH_JS)
                 page = await ctx.new_page()
 
-                # 1. Mint userKey. The core problem is that page.goto()
-                # triggers a fresh Cloudflare JS challenge on EVERY new URL —
-                # even subpaths of a domain we've already cleared.  The fix is
-                # to use page.request.get() instead, which reuses the browser
-                # context's existing cookie jar (including cf_clearance set
-                # during warmup) without creating a new page load.
-                #
-                # Strategy:
-                #   a) page.goto("https://perchance.org/ai-text-to-image-generator")
-                #      — clears CF on perchance.org AND sets cookies for
-                #      .perchance.org (the subdomain's cookies ride along).
-                #   b) page.request.get(API + "/verifyUser?thread=0&__cacheBust=<rand>")
-                #      — sends existing CF cookies via Playwright's
-                #      APIRequestContext; no new page load, no new challenge.
-                #   c) Regex "userKey":"([a-f0-9]{64})" from the response text.
+                # 1. Mint userKey.  The core insight: perchance.org embeds
+                # image-generation.perchance.org inside an <iframe>.  In a real
+                # browser the iframe loads, CF clears inside it, and the
+                # iframe's JS calls verifyUser and writes the result to
+                # window.__USER_DATA__.  Playwright can access cross-origin
+                # frames via page.frames — so we wait for the iframe to
+                # appear, find it by URL pattern, then read __USER_DATA__
+                # directly from the iframe's window context.
                 user_key = None
                 last_diag = ""
 
@@ -185,9 +178,11 @@ jobs:
                     except Exception:
                         pass
 
-                # Warmup: visit the human-facing Perchance page so CF sets
-                # cf_clearance / __cf_bm cookies for .perchance.org.  The
-                # page itself is irrelevant — we just need the cookies.
+                # Step 1: warmup — visit the human-facing Perchance page.
+                # CF challenge loads and clears, setting cf_clearance cookies
+                # for .perchance.org.  The page's JS then creates an iframe
+                # pointing at image-generation.perchance.org which clears CF
+                # for the subdomain too.
                 try:
                     await page.goto(
                         "https://perchance.org/ai-text-to-image-generator",
@@ -195,7 +190,9 @@ jobs:
                         timeout=45000,
                     )
                     await _wait_cf_clear(timeout_s=30)
-                    await page.wait_for_timeout(2500)
+                    # Give the page JS time to create the iframe and for
+                    # the iframe to load + clear its own CF challenge.
+                    await page.wait_for_timeout(8000)
                     try:
                         title = await page.title()
                     except Exception:
@@ -204,53 +201,71 @@ jobs:
                 except Exception as e:
                     last_diag += f"warmup err={e}; "
 
-                # Mint: use page.request.get() to fetch verifyUser from the
-                # ALREADY-LOADED page context.  No new page.goto() means no
-                # fresh CF challenge — the existing cookies travel along.
-                for mint_attempt in range(3):
-                    cache_bust = random.random()
-                    verify_url = f"{API}/verifyUser?thread=0&__cacheBust={cache_bust}"
-                    try:
-                        resp = await page.request.get(
-                            verify_url,
-                            timeout=30000,
-                        )
-                        body_text = await resp.text()
-                        if "too_many_requests" in body_text:
-                            user_key = None
-                            last_diag += f"mint-attempt{mint_attempt} RATE_LIMIT; "
-                            break
-                        m = re.search(r'"userKey":"([a-f0-9]{64})"', body_text)
-                        if m:
-                            user_key = m.group(1)
-                            last_diag += f"mint-attempt{mint_attempt} OK; "
-                            break
-                        last_diag += (
-                            f"mint-attempt{mint_attempt} "
-                            f"status={resp.status} "
-                            f"bodylen={len(body_text)} "
-                            f"snippet={body_text[:200]!r}; "
-                        )
-                    except Exception as e:
-                        last_diag += f"mint-attempt{mint_attempt} err={e}; "
-                    await page.wait_for_timeout(2000)
+                # Step 2: find the iframe and extract __USER_DATA__.  The
+                # iframe loads image-generation.perchance.org.  Playwright's
+                # page.frames includes cross-origin frames — we match by URL
+                # pattern and then evaluate JS inside the frame context.
+                IFRA = "image-generation.perchance.org"
+                for frame_attempt in range(10):
+                    for frame in page.frames:
+                        if IFRA in frame.url:
+                            last_diag += f"frame-found url={frame.url[:80]!r}; "
+                            try:
+                                key = await frame.evaluate(
+                                    "() => (window.__USER_DATA__ && window.__USER_DATA__.userKey) ? window.__USER_DATA__.userKey : null"
+                                )
+                                if key and re.fullmatch(r"[a-f0-9]{64}", str(key)):
+                                    user_key = str(key)
+                                    last_diag += f"frame-attempt{frame_attempt} OK; "
+                                    break
+                                last_diag += f"frame-attempt{frame_attempt} __USER_DATA__=null; "
+                            except Exception as e:
+                                last_diag += f"frame-attempt{frame_attempt} eval-err={e!r}; "
+                    if user_key:
+                        break
+                    await page.wait_for_timeout(3000)
 
+                # Step 3 (fallback): if the iframe never appeared or
+                # __USER_DATA__ never populated, try fetching verifyUser
+                # via page.request.get() using cookies the iframe may have
+                # set during its CF challenge.
                 if not user_key:
-                    # Fallback: try page.goto() directly on verifyUser — this
-                    # might work if the warmup cookies carry despite the fresh
-                    # challenge (Turnstile sometimes auto-passes on retries).
-                    print(f"page.request mint failed, trying goto fallback. diag={last_diag}", file=sys.stderr)
+                    last_diag += "iframe-mint-failed; trying request.get; "
+                    for req_attempt in range(3):
+                        cache_bust = random.random()
+                        verify_url = f"{API}/verifyUser?thread=0&__cacheBust={cache_bust}"
+                        try:
+                            resp = await page.request.get(verify_url, timeout=30000)
+                            body_text = await resp.text()
+                            if "too_many_requests" in body_text:
+                                last_diag += f"req-attempt{req_attempt} RATE_LIMIT; "
+                                break
+                            m = re.search(r'"userKey":"([a-f0-9]{64})"', body_text)
+                            if m:
+                                user_key = m.group(1)
+                                last_diag += f"req-attempt{req_attempt} OK; "
+                                break
+                            last_diag += (
+                                f"req-attempt{req_attempt} "
+                                f"status={resp.status} "
+                                f"bodylen={len(body_text)}; "
+                            )
+                        except Exception as e:
+                            last_diag += f"req-attempt{req_attempt} err={e!r}; "
+                        await page.wait_for_timeout(2000)
+
+                # Step 4 (last resort): page.goto on verifyUser directly.
+                if not user_key:
+                    last_diag += "req-mint-failed; trying goto; "
                     for goto_attempt in range(3):
                         cache_bust = random.random()
                         verify_url = f"{API}/verifyUser?thread=0&__cacheBust={cache_bust}"
                         try:
-                            await page.goto(verify_url,
-                                            wait_until="domcontentloaded",
-                                            timeout=45000)
+                            await page.goto(verify_url, wait_until="domcontentloaded", timeout=45000)
                             await _wait_cf_clear(timeout_s=30)
                             content = await page.content()
                             if "too_many_requests" in content:
-                                print(f"mint: rate-limited (goto fallback). diag={last_diag}", file=sys.stderr)
+                                print(f"mint: rate-limited. diag={last_diag}", file=sys.stderr)
                                 await browser.close()
                                 print("ERROR:RATE_LIMIT")
                                 return
@@ -266,11 +281,10 @@ jobs:
                             last_diag += (
                                 f"goto-attempt{goto_attempt} "
                                 f"title={title!r} "
-                                f"bodylen={len(content)} "
-                                f"snippet={content[:200]!r}; "
+                                f"bodylen={len(content)}; "
                             )
                         except Exception as e:
-                            last_diag += f"goto-attempt{goto_attempt} err={e}; "
+                            last_diag += f"goto-attempt{goto_attempt} err={e!r}; "
                         await page.wait_for_timeout(2500)
 
                 if not user_key:
@@ -278,7 +292,6 @@ jobs:
                     await browser.close()
                     print("ERROR:CF_CHALLENGE")
                     return
-
                 # 2. POST /api/generate and download via the page.request helper
                 # (an APIRequestContext bound to this browser context). It uses
                 # the same cookies/UA as the page itself and bypasses CORS,
