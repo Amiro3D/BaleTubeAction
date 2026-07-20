@@ -157,14 +157,23 @@ jobs:
                 await ctx.add_init_script(STEALTH_JS)
                 page = await ctx.new_page()
 
-                # 1. Mint userKey. Strategy: visit the human-facing
-                # https://perchance.org/ai-text-to-image-generator page and let
-                # its own JS populate window.__USER_DATA__ (which contains the
-                # userKey). This is what a real browser session would do, so
-                # Cloudflare's silent Turnstile auto-passes and Perchance's
-                # JS handler writes the key into the page it already trusts.
-                # Fallback: hit /api/verifyUser directly and regex-scrape the
-                # "userKey":"..." string out of the resulting HTML.
+                # 1. Mint userKey. Strategy (the canonical eeemoon recipe,
+                # confirmed against the most popular PyPI Perchance wrapper):
+                #   a) Warm up Cloudflare by visiting the apex perchance.org
+                #      page so the cf_clearance / __cf_bm cookies get written
+                #      for .perchance.org.  Apex navigation is the lightest
+                #      CF challenge; once cookies are in the jar they ride
+                #      along on the next goto to the API subdomain.
+                #   b) Navigate directly to
+                #      https://image-generation.perchance.org/api/verifyUser
+                #      ?thread=0&__cacheBust=<random>  and regex-scrape the
+                #      "userKey":"([a-f0-9]{64})" string out of the HTML body.
+                #
+                # We deliberately do NOT scrape window.__USER_DATA__ from the
+                # top-level page — that object lives inside the cross-origin
+                # image-generation.perchance.org iframe, so it never appears
+                # on perchance.org's window.  The direct /api/verifyUser call
+                # is the proven path used by every working wrapper.
                 user_key = None
                 last_diag = ""
 
@@ -183,53 +192,27 @@ jobs:
                     except Exception:
                         pass
 
-                async def try_mint_via_page(pages_url):
-                    """Navigate to a Perchance page; wait for window.__USER_DATA__."""
+                async def warmup_cf():
+                    """Visit perchance.org apex so Cloudflare sets cookies
+                    for .perchance.org.  Apex navigation is the lightest CF
+                    challenge; cookies established here travel to the
+                    image-generation subdomain on the next goto."""
                     nonlocal last_diag
-                    for attempt in range(3):
-                        try:
-                            await page.goto(pages_url,
-                                            wait_until="domcontentloaded",
-                                            timeout=45000)
-                            # Cloudflare's 'Just a moment...' interstitial loads
-                            # first.  Wait for it to clear before scraping
-                            # window.__USER_DATA__.
-                            await _wait_cf_clear(timeout_s=30)
-                            # Cloudflare's silent Turnstile takes 5-10s to
-                            # solve and write cookies. Wait for either
-                            # window.__USER_DATA__ to appear, or 25s max.
-                            try:
-                                await page.wait_for_function(
-                                    "() => !!(window.__USER_DATA__ && window.__USER_DATA__.userKey)",
-                                    timeout=25000
-                                )
-                            except Exception:
-                                # Page loaded but __USER_DATA__ never arrived.
-                                # Record page state so the next log shows why.
-                                try:
-                                    title = await page.title()
-                                except Exception:
-                                    title = "<no title>"
-                                try:
-                                    body_short = (await page.content())[:300]
-                                except Exception:
-                                    body_short = "<no body>"
-                                last_diag += (
-                                    f"page-attempt{attempt} "
-                                    f"title={title!r} "
-                                    f"body={body_short!r}; "
-                                )
-                                await page.wait_for_timeout(2500)
-                                continue
-                            dat = await page.evaluate(
-                                "() => (window.__USER_DATA__ && window.__USER_DATA__.userKey) ? window.__USER_DATA__.userKey : null"
-                            )
-                            if dat and re.fullmatch(r"[a-f0-9]{64}", dat):
-                                return dat
-                        except Exception as e:
-                            last_diag += f"page-attempt{attempt} err={e}; "
+                    try:
+                        await page.goto("https://perchance.org",
+                                        wait_until="domcontentloaded",
+                                        timeout=45000)
+                        await _wait_cf_clear(timeout_s=30)
+                        # Give the silent Turnstile a moment to finish
+                        # writing cookies even after the title flips.
                         await page.wait_for_timeout(2500)
-                    return None
+                        try:
+                            title = await page.title()
+                        except Exception:
+                            title = "<no title>"
+                        last_diag += f"warmup title={title!r}; "
+                    except Exception as e:
+                        last_diag += f"warmup err={e}; "
 
                 async def try_mint_via_verifyuser():
                     """Hit /api/verifyUser directly and regex out userKey."""
@@ -266,21 +249,22 @@ jobs:
                         await page.wait_for_timeout(2500)
                     return (None, None)
 
-                user_key = await try_mint_via_page("https://perchance.org/ai-text-to-image-generator")
-                if not user_key:
-                    print(f"mint: page fallback to verifyUser. diag={last_diag}", file=sys.stderr)
-                    err, key = await try_mint_via_verifyuser()
-                    if err == "RATE_LIMIT":
-                        await browser.close()
-                        print("ERROR:RATE_LIMIT")
-                        return
-                    if key:
-                        user_key = key
-                    else:
-                        print(f"mint failed: cf challenge. diag={last_diag}", file=sys.stderr)
-                        await browser.close()
-                        print("ERROR:CF_CHALLENGE")
-                        return
+                # Step a: warm up CF on the apex domain.
+                await warmup_cf()
+                # Step b: mint via the direct verifyUser endpoint.
+                err, key = await try_mint_via_verifyuser()
+                if err == "RATE_LIMIT":
+                    print(f"mint: rate-limited. diag={last_diag}", file=sys.stderr)
+                    await browser.close()
+                    print("ERROR:RATE_LIMIT")
+                    return
+                if key:
+                    user_key = key
+                else:
+                    print(f"mint failed: cf challenge. diag={last_diag}", file=sys.stderr)
+                    await browser.close()
+                    print("ERROR:CF_CHALLENGE")
+                    return
 
                 # 2. POST /api/generate and download via the page.request helper
                 # (an APIRequestContext bound to this browser context). It uses
