@@ -201,6 +201,10 @@ jobs:
                 except Exception as e:
                     last_diag += f"warmup err={e}; "
 
+                # DEBUG: log all frame URLs so we can see what the page loaded.
+                for fi, fr in enumerate(page.frames):
+                    last_diag += f"frame[{fi}]={fr.url[:120]!r}; "
+
                 # Step 2: find the iframe and extract __USER_DATA__.  The
                 # iframe loads image-generation.perchance.org.  Playwright's
                 # page.frames includes cross-origin frames — we match by URL
