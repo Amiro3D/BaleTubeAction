@@ -76,7 +76,32 @@ def run_web_search(query: str) -> str:
         print(f"[Search Error] {e}", file=sys.stderr, flush=True)
         return f"خطا در جستجو: {e}"
 
+def run_read_file(filepath: str) -> str:
+    print(f"[Agent] Reading file: {filepath}", flush=True)
+    try:
+        clean_path = os.path.basename(filepath)
+        if os.path.exists(clean_path):
+            with open(clean_path, 'r', encoding='utf-8', errors='replace') as f:
+                return f.read()[:2000]
+        return f"File '{filepath}' not found or cannot be accessed."
+    except Exception as e:
+        return f"Error reading file: {e}"
+
 TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read",
+            "description": "Read file contents from disk or repository.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filePath": {"type": "string", "description": "Path to file"}
+                },
+                "required": ["filePath"]
+            }
+        }
+    },
     {
         "type": "function",
         "function": {
@@ -113,8 +138,12 @@ def send_bale_request(method: str, params: dict, token: str):
                     retry_after = j.get("parameters", {}).get("retry_after", 3)
                     time.sleep(retry_after + 2)
                     continue
+                if e.code in (400, 401, 403, 404):
+                    return j
             except Exception:
                 pass
+            if e.code in (400, 401, 403, 404):
+                return None
             time.sleep(attempt + 1)
         except Exception as e:
             time.sleep(attempt + 1)
@@ -195,6 +224,7 @@ def call_opencode_stream(messages, model, api_key):
             try:
                 resp = urllib.request.urlopen(req, timeout=60)
                 full_content = ""
+                full_reasoning = ""
                 tool_calls_map = {}
                 
                 for line in resp:
@@ -209,6 +239,8 @@ def call_opencode_stream(messages, model, api_key):
                         delta = chunk.get('choices', [{}])[0].get('delta', {})
                         if 'content' in delta and delta['content']:
                             full_content += delta['content']
+                        if 'reasoning' in delta and delta['reasoning']:
+                            full_reasoning += delta['reasoning']
                         if 'tool_calls' in delta and delta['tool_calls']:
                             for tc in delta['tool_calls']:
                                 idx = tc.get('index', 0)
@@ -226,6 +258,9 @@ def call_opencode_stream(messages, model, api_key):
                                     tool_calls_map[idx]['arguments'] += tc['function']['arguments']
                     except Exception:
                         continue
+                
+                if not full_content.strip() and full_reasoning.strip() and not tool_calls_map:
+                    full_content = full_reasoning.strip()
                 
                 tool_calls = list(tool_calls_map.values()) if tool_calls_map else None
                 return {
@@ -374,6 +409,27 @@ def main():
                     "name": "web_search",
                     "content": search_res
                 })
+            elif tc_name == "read":
+                filepath = ""
+                try:
+                    args = json.loads(tc_args_str)
+                    filepath = args.get("filePath") or args.get("path") or ""
+                except Exception:
+                    pass
+                read_res = run_read_file(filepath)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc_id,
+                    "name": "read",
+                    "content": read_res
+                })
+            else:
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc_id,
+                    "name": tc_name or "unknown",
+                    "content": "Tool executed."
+                })
 
         # Step 3: Second call to generate grounded answer
         edit_bale_message(chat_id, msg_id, "✍️ **در حال جمع‌بندی و نگارش پاسخ با داده‌های زنده وب...**", bale_token)
@@ -398,8 +454,14 @@ def main():
 
     full_text = f"🤖 **پاسخ هوش مصنوعی** ({model}):\n\n{final_answer}"
     
-    # Deliver answer to user
-    edit_bale_message(chat_id, msg_id, full_text, bale_token)
+    # Deliver answer to user (chunked if > 3800 chars)
+    if len(full_text) <= 3800:
+        edit_bale_message(chat_id, msg_id, full_text, bale_token)
+    else:
+        chunks = [full_text[i:i+3500] for i in range(0, len(full_text), 3500)]
+        edit_bale_message(chat_id, msg_id, chunks[0], bale_token)
+        for chunk in chunks[1:]:
+            send_bale_message(chat_id, chunk, bale_token)
 
     # Optional group chat notification
     if group_chat_id and group_chat_id != "0":
