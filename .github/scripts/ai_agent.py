@@ -391,7 +391,7 @@ def main():
                 "user_message": question,
                 "assistant_message": final_answer
             }, ensure_ascii=False).encode('utf-8')
-            ureq = urllib.request.Request(update_url, data=update_body, headers={"Content-Type": "application/json"}, method="POST")
+            ureq = urllib.request.Request(update_url, data=update_body, headers={"Content-Type": "application/json", "User-Agent": "CFWorker-Agent/1.0"}, method="POST")
             with urllib.request.urlopen(ureq, timeout=10) as uresp:
                 print(f"[History Updated] Status: {uresp.status}", flush=True)
         except Exception as e:
