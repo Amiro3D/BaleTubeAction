@@ -9,6 +9,11 @@ import urllib.request
 import urllib.parse
 import re
 
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 # ──────────────── ID Generator ────────────────
 _id_lock = threading.Lock()
 _id_time = 0
@@ -52,10 +57,21 @@ def pace_request():
 def run_web_search(query: str) -> str:
     print(f"[Agent] Executing web search: {query}", flush=True)
     try:
-        from duckduckgo_search import DDGS
+        try:
+            from ddgs import DDGS
+        except ImportError:
+            from duckduckgo_search import DDGS
+            
         with DDGS() as ddgs:
-            results = [f"• {r.get('title', '')}: {r.get('body', '')}" for r in ddgs.text(query, max_results=4)]
-            return "\n".join(results) if results else "نتیجه‌ای یافت نشد."
+            raw_results = list(ddgs.text(query, max_results=4))
+            formatted = []
+            for r in raw_results:
+                title = r.get('title', '').strip()
+                body = r.get('body', '').strip()
+                href = r.get('href', '').strip()
+                if title or body:
+                    formatted.append(f"- {title}: {body} ({href})")
+            return "\n".join(formatted) if formatted else "نتیجه‌ای یافت نشد."
     except Exception as e:
         print(f"[Search Error] {e}", file=sys.stderr, flush=True)
         return f"خطا در جستجو: {e}"
