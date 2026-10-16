@@ -16,12 +16,11 @@ jobs:
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
-        cache: 'pip'
 
     - name: Install dependencies
       run: |
         pip install --upgrade pip
-        pip install duckduckgo-search requests
+        pip install -r requirements.txt
 
     - name: Run AI Agent
       env:
@@ -29,7 +28,6 @@ jobs:
         OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
         QUESTION: ${{ github.event.client_payload.question }}
         MODEL: ${{ github.event.client_payload.model || 'mimo-v2.6-flash-free' }}
-        HISTORY_JSON: ${{ toJson(github.event.client_payload.history) }}
         CHAT_ID: ${{ github.event.client_payload.chat_id }}
         MSG_ID: ${{ github.event.client_payload.msg_id || '' }}
         GROUP_CHAT_ID: ${{ github.event.client_payload.group_chat_id || '' }}

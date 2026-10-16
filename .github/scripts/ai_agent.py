@@ -263,16 +263,39 @@ def main():
     msg_id = os.environ.get("MSG_ID", "").strip()
     group_chat_id = os.environ.get("GROUP_CHAT_ID", "").strip()
     worker_url = os.environ.get("WORKER_URL", "").strip()
-    
-    history_json_str = os.environ.get("HISTORY_JSON", "").strip()
     history = []
-    if history_json_str:
+
+    # Try reading directly from GitHub Actions event payload file if present
+    event_path = os.environ.get("GITHUB_EVENT_PATH")
+    if event_path and os.path.exists(event_path):
         try:
-            parsed = json.loads(history_json_str)
-            if isinstance(parsed, list):
-                history = parsed
+            with open(event_path, "r", encoding="utf-8") as f:
+                event_data = json.load(f)
+            payload = event_data.get("client_payload", {})
+            if payload.get("question"):
+                question = str(payload["question"]).strip()
+            if payload.get("model"):
+                model = str(payload["model"]).strip()
+            if payload.get("chat_id"):
+                chat_id = str(payload["chat_id"]).strip()
+            if payload.get("msg_id"):
+                msg_id = str(payload["msg_id"]).strip()
+            if payload.get("group_chat_id"):
+                group_chat_id = str(payload["group_chat_id"]).strip()
+            if payload.get("history") and isinstance(payload["history"], list):
+                history = payload["history"]
         except Exception as e:
-            print(f"[History Parse Warning] {e}", file=sys.stderr)
+            print(f"[Event Read Warning] {e}", file=sys.stderr)
+
+    if not history:
+        history_json_str = os.environ.get("HISTORY_JSON", "").strip()
+        if history_json_str:
+            try:
+                parsed = json.loads(history_json_str)
+                if isinstance(parsed, list):
+                    history = parsed
+            except Exception as e:
+                print(f"[History Parse Warning] {e}", file=sys.stderr)
 
     if not question:
         print("[Error] No question provided", file=sys.stderr)
@@ -400,4 +423,18 @@ def main():
     print("[Agent Finished Successfully]", flush=True)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"[FATAL AGENT ERROR] {e}", file=sys.stderr, flush=True)
+        import traceback
+        traceback.print_exc()
+        try:
+            cid = os.environ.get("CHAT_ID", "").strip()
+            mid = os.environ.get("MSG_ID", "").strip()
+            btok = os.environ.get("BALE_BOT_TOKEN", "").strip()
+            if cid and btok:
+                edit_bale_message(cid, mid, f"❌ خطا در پردازش درخواست هوش مصنوعی: {e}", btok)
+        except Exception:
+            pass
+        sys.exit(1)
