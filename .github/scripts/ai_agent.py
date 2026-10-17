@@ -71,7 +71,7 @@ def run_web_search(query: str) -> str:
                 href = r.get('href', '').strip()
                 if title or body:
                     formatted.append(f"- {title}: {body} ({href})")
-            return "\n".join(formatted) if formatted else "نتیجه‌ای یافت نشد."
+            return "\n".join(formatted) if formatted else "نتیجه‌ای در جستجو یافت نشد."
     except Exception as e:
         print(f"[Search Error] {e}", file=sys.stderr, flush=True)
         return f"خطا در جستجو: {e}"
@@ -150,7 +150,7 @@ def send_bale_request(method: str, params: dict, token: str):
     return None
 
 def edit_bale_message(chat_id, message_id, text, token):
-    if not message_id:
+    if not message_id or str(message_id) == "0":
         return send_bale_message(chat_id, text, token)
     res = send_bale_request("editMessageText", {
         "chat_id": chat_id,
@@ -180,7 +180,7 @@ def send_bale_message(chat_id, text, token):
     return res
 
 # ──────────────── OpenCode SSE Caller ────────────────
-def call_opencode_stream(messages, model, api_key):
+def call_opencode_stream(messages, model, api_key, tools_override=None):
     pace_request()
     
     auth_tokens_to_try = []
@@ -189,18 +189,20 @@ def call_opencode_stream(messages, model, api_key):
     auth_tokens_to_try.append("public")
     
     url = "https://opencode.ai/zen/v1/chat/completions"
+    current_tools = TOOLS if tools_override is None else tools_override
     
     payload = {
         "model": model,
         "messages": messages,
         "stream": True,
-        "tools": TOOLS,
         "temperature": 0.7,
         "max_tokens": 2048
     }
+    if current_tools:
+        payload["tools"] = current_tools
+
     data = json.dumps(payload, ensure_ascii=False).encode('utf-8')
-    
-    delays = [3, 6, 15]
+    delays = [2, 5, 10]
     
     for token_candidate in auth_tokens_to_try:
         is_key = (token_candidate != "public")
@@ -222,7 +224,7 @@ def call_opencode_stream(messages, model, api_key):
             
             req = urllib.request.Request(url, data=data, headers=headers, method="POST")
             try:
-                resp = urllib.request.urlopen(req, timeout=60)
+                resp = urllib.request.urlopen(req, timeout=45)
                 full_content = ""
                 full_reasoning = ""
                 tool_calls_map = {}
@@ -236,7 +238,10 @@ def call_opencode_stream(messages, model, api_key):
                         break
                     try:
                         chunk = json.loads(line_data)
-                        delta = chunk.get('choices', [{}])[0].get('delta', {})
+                        choices = chunk.get('choices')
+                        if not choices:
+                            continue
+                        delta = choices[0].get('delta', {})
                         if 'content' in delta and delta['content']:
                             full_content += delta['content']
                         if 'reasoning' in delta and delta['reasoning']:
@@ -266,6 +271,7 @@ def call_opencode_stream(messages, model, api_key):
                 return {
                     "ok": True,
                     "content": full_content,
+                    "reasoning": full_reasoning,
                     "tool_calls": tool_calls
                 }
             except urllib.error.HTTPError as e:
@@ -273,10 +279,8 @@ def call_opencode_stream(messages, model, api_key):
                 err_body = e.read().decode('utf-8', errors='ignore')
                 print(f"[OpenCode Error] Status {status} (token={'key' if is_key else 'public'}): {err_body[:200]}", file=sys.stderr, flush=True)
                 if status in (401, 403):
-                    # Break out to try the next auth candidate (e.g. public)
                     break
                 elif status == 429:
-                    # Rate limit; back off using intervals [3, 6, 15]
                     continue
                 else:
                     if attempt < len(delays):
@@ -288,173 +292,153 @@ def call_opencode_stream(messages, model, api_key):
                     
     return {"ok": False, "error": "OpenCode API request failed on all attempts."}
 
-# ──────────────── Main Agent Runner ────────────────
-def main():
-    bale_token = os.environ.get("BALE_BOT_TOKEN", "").strip()
-    opencode_key = os.environ.get("OPENCODE_API_KEY", "").strip()
-    question = os.environ.get("QUESTION", "").strip()
-    model = os.environ.get("MODEL", "").strip() or "mimo-v2.6-flash-free"
-    chat_id = os.environ.get("CHAT_ID", "").strip()
-    msg_id = os.environ.get("MSG_ID", "").strip()
-    group_chat_id = os.environ.get("GROUP_CHAT_ID", "").strip()
-    worker_url = os.environ.get("WORKER_URL", "").strip()
-    history = []
-
-    # Try reading directly from GitHub Actions event payload file if present
-    event_path = os.environ.get("GITHUB_EVENT_PATH")
-    if event_path and os.path.exists(event_path):
-        try:
-            with open(event_path, "r", encoding="utf-8") as f:
-                event_data = json.load(f)
-            payload = event_data.get("client_payload", {})
-            if payload.get("question"):
-                question = str(payload["question"]).strip()
-            if payload.get("model"):
-                model = str(payload["model"]).strip()
-            if payload.get("chat_id"):
-                chat_id = str(payload["chat_id"]).strip()
-            if payload.get("msg_id"):
-                msg_id = str(payload["msg_id"]).strip()
-            if payload.get("group_chat_id"):
-                group_chat_id = str(payload["group_chat_id"]).strip()
-            if payload.get("history") and isinstance(payload["history"], list):
-                history = payload["history"]
-        except Exception as e:
-            print(f"[Event Read Warning] {e}", file=sys.stderr)
-
-    if not history:
-        history_json_str = os.environ.get("HISTORY_JSON", "").strip()
-        if history_json_str:
-            try:
-                parsed = json.loads(history_json_str)
-                if isinstance(parsed, list):
-                    history = parsed
-            except Exception as e:
-                print(f"[History Parse Warning] {e}", file=sys.stderr)
+# ──────────────── Job Processor ────────────────
+def process_job(job_data, bale_token, opencode_key, worker_url):
+    question = job_data.get("question", "").strip()
+    model = job_data.get("model", "").strip() or "mimo-v2.6-flash-free"
+    chat_id = job_data.get("chat_id", "").strip()
+    msg_id = job_data.get("msg_id", "").strip()
+    group_chat_id = job_data.get("group_chat_id", "").strip()
+    history = job_data.get("history") or []
 
     if not question:
-        print("[Error] No question provided", file=sys.stderr)
-        if chat_id:
-            edit_bale_message(chat_id, msg_id, "❌ سوالی دریافت نشد.", bale_token)
-        sys.exit(0)
+        return
 
-    print(f"[Agent Started] Chat: {chat_id}, Model: {model}, Question: {question[:80]}", flush=True)
+    print(f"\n[Agent Processing] Chat: {chat_id}, Model: {model}, Question: {question[:80]}", flush=True)
 
     sys_prompt = (
         "You are an advanced, intelligent Persian AI Assistant named 'Mr.3D AI'.\n"
         "You have access to a live 'web_search' tool to browse the real-time internet, search for current facts, news, and technical information.\n"
         "Always respond in fluent, natural Persian (Farsi) unless the user specifically asks in another language.\n"
-        "When you use web_search, formulate clear, concise queries and synthesize the findings naturally into your answer without showing raw search syntax."
+        "When you use web_search, formulate clear queries and synthesize the findings naturally into your answer."
     )
 
     messages = [{"role": "system", "content": sys_prompt}]
-    
-    # Inject context window history
     if history:
         for turn in history:
             if isinstance(turn, dict) and turn.get("role") and turn.get("content"):
                 messages.append({"role": turn["role"], "content": turn["content"]})
-                
     messages.append({"role": "user", "content": question})
 
-    # Step 1: Call Model
-    res1 = call_opencode_stream(messages, model, opencode_key)
-    if not res1.get("ok"):
-        err_msg = res1.get("error", "خطا در برقراری ارتباط با مدل هوش مصنوعی.")
-        edit_bale_message(chat_id, msg_id, f"❌ {err_msg}", bale_token)
-        sys.exit(0)
+    MAX_AGENT_TURNS = 3
+    final_answer = ""
+    tool_results_log = []
 
-    tool_calls = res1.get("tool_calls")
-    
-    # Step 2: Check for Tool Calls (Agentic Web Search Loop)
-    if tool_calls:
-        print(f"[Agent Tool Call] Model requested {len(tool_calls)} tool call(s)", flush=True)
-        asst_msg = {
-            "role": "assistant",
-            "content": res1.get("content") or None,
-            "tool_calls": [
-                {
-                    "id": tc["id"] or f"call_{i}",
-                    "type": "function",
-                    "function": {
-                        "name": tc["name"],
-                        "arguments": tc["arguments"]
+    for turn in range(MAX_AGENT_TURNS):
+        res = call_opencode_stream(messages, model, opencode_key)
+        if not res.get("ok"):
+            err_msg = res.get("error", "خطا در برقراری ارتباط با مدل هوش مصنوعی.")
+            print(f"[Turn {turn+1} Error] {err_msg}", file=sys.stderr)
+            break
+
+        tool_calls = res.get("tool_calls")
+        content = res.get("content", "").strip()
+        reasoning = res.get("reasoning", "").strip()
+
+        if tool_calls and turn < MAX_AGENT_TURNS - 1:
+            print(f"[Turn {turn+1}] Model requested {len(tool_calls)} tool call(s)", flush=True)
+            asst_msg = {
+                "role": "assistant",
+                "content": content or None,
+                "tool_calls": [
+                    {
+                        "id": tc["id"] or f"call_{i}",
+                        "type": "function",
+                        "function": {"name": tc["name"], "arguments": tc["arguments"]}
                     }
-                }
-                for i, tc in enumerate(tool_calls)
-            ]
-        }
-        messages.append(asst_msg)
+                    for i, tc in enumerate(tool_calls)
+                ]
+            }
+            messages.append(asst_msg)
 
-        for i, tc in enumerate(tool_calls):
-            tc_name = tc.get("name")
-            tc_args_str = tc.get("arguments", "{}")
-            tc_id = tc.get("id") or f"call_{i}"
+            for i, tc in enumerate(tool_calls):
+                tc_name = tc.get("name")
+                tc_args_str = tc.get("arguments", "{}")
+                tc_id = tc.get("id") or f"call_{i}"
 
-            if tc_name == "web_search":
-                query = question
-                try:
-                    args = json.loads(tc_args_str)
-                    query = args.get("query") or question
-                except Exception:
-                    pass
+                if tc_name == "web_search":
+                    query = question
+                    try:
+                        args = json.loads(tc_args_str)
+                        query = args.get("query") or question
+                    except Exception:
+                        pass
 
-                # Live status update in Bale chat
-                edit_bale_message(chat_id, msg_id, f"🔍 **در حال جستجوی وب برای:**\n`{query}`...", bale_token)
-                
-                search_res = run_web_search(query)
+                    edit_bale_message(chat_id, msg_id, f"🔍 **در حال جستجوی وب برای:**\n`{query}`...", bale_token)
+                    search_res = run_web_search(query)
+                    tool_results_log.append(f"جستجو برای '{query}':\n{search_res}")
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc_id,
+                        "name": "web_search",
+                        "content": search_res
+                    })
+                elif tc_name == "read":
+                    filepath = ""
+                    try:
+                        args = json.loads(tc_args_str)
+                        filepath = args.get("filePath") or args.get("path") or ""
+                    except Exception:
+                        pass
+                    read_res = run_read_file(filepath)
+                    tool_results_log.append(f"خواندن فایل '{filepath}':\n{read_res}")
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc_id,
+                        "name": "read",
+                        "content": read_res
+                    })
+                else:
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc_id,
+                        "name": tc_name or "unknown",
+                        "content": "Tool executed."
+                    })
+
+            if turn == MAX_AGENT_TURNS - 2:
+                edit_bale_message(chat_id, msg_id, "✍️ **در حال جمع‌بندی و نگارش پاسخ با داده‌های زنده وب...**", bale_token)
                 messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc_id,
-                    "name": "web_search",
-                    "content": search_res
+                    "role": "user",
+                    "content": "با توجه به تمام اطلاعات و نتایج جستجوی بالا، لطفاً اکنون پاسخ نهایی، جامع و کامل را به زبان فارسی بنویس."
                 })
-            elif tc_name == "read":
-                filepath = ""
-                try:
-                    args = json.loads(tc_args_str)
-                    filepath = args.get("filePath") or args.get("path") or ""
-                except Exception:
-                    pass
-                read_res = run_read_file(filepath)
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc_id,
-                    "name": "read",
-                    "content": read_res
-                })
-            else:
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc_id,
-                    "name": tc_name or "unknown",
-                    "content": "Tool executed."
-                })
+        else:
+            final_answer = content.strip() or reasoning.strip()
+            break
 
-        # Step 3: Second call to generate grounded answer
-        edit_bale_message(chat_id, msg_id, "✍️ **در حال جمع‌بندی و نگارش پاسخ با داده‌های زنده وب...**", bale_token)
-        res2 = call_opencode_stream(messages, model, opencode_key)
-        if not res2.get("ok"):
-            err_msg = res2.get("error", "خطا در دریافت پاسخ نهایی از مدل.")
-            edit_bale_message(chat_id, msg_id, f"❌ {err_msg}", bale_token)
-            sys.exit(0)
-            
-        final_answer = res2.get("content", "").strip()
-    else:
-        final_answer = res1.get("content", "").strip()
+    # If final answer is still empty after loop but tools were run, synthesize from results
+    if not final_answer and tool_results_log:
+        print("[Agent Fallback] Synthesizing answer from search results...", flush=True)
+        edit_bale_message(chat_id, msg_id, "✍️ **در حال نگارش پاسخ با اطلاعات به دست آمده...**", bale_token)
+        synth_msgs = [
+            {"role": "system", "content": "You are a helpful Persian AI assistant named Mr.3D AI. Answer the user question comprehensively in Persian based on the search context."},
+            {"role": "user", "content": f"سوال کاربر: {question}\n\nاطلاعات جستجوشده از وب:\n" + "\n\n".join(tool_results_log[:5]) + "\n\nلطفاً پاسخ کامل، مفید و ساختاریافته به زبان فارسی ارائه بده."}
+        ]
+        synth_res = call_opencode_stream(synth_msgs, "nemotron-3.5-lightning-free", opencode_key)
+        if synth_res.get("ok"):
+            final_answer = synth_res.get("content", "").strip() or synth_res.get("reasoning", "").strip()
+
+    # Emergency fallback retry if still empty
+    if not final_answer:
+        em_res = call_opencode_stream([
+            {"role": "system", "content": "You are a helpful Persian AI assistant."},
+            {"role": "user", "content": question}
+        ], "nemotron-3.5-lightning-free", opencode_key)
+        if em_res.get("ok"):
+            final_answer = em_res.get("content", "").strip()
 
     if not final_answer:
-        edit_bale_message(chat_id, msg_id, "❌ پاسخ خالی از هوش مصنوعی دریافت شد. لطفاً دوباره تلاش کنید.", bale_token)
-        sys.exit(0)
+        edit_bale_message(chat_id, msg_id, "❌ متأسفانه دریافت پاسخ از سرور هوش مصنوعی با خطا مواجه شد. لطفاً دوباره سوال خود را ارسال فرمایید.", bale_token)
+        return
 
-    # Defensive formatting: remove leaked reasoning headers if any
+    # Clean leaked reasoning headers if any
     hdr = final_answer.rfind('**Answer**')
     if hdr != -1 and re.search(r'\*\*Reasoning|Reasoning and information|Reasoning used', final_answer[:hdr], re.IGNORECASE):
         final_answer = final_answer[hdr + len('**Answer**'):].strip()
 
     full_text = f"🤖 **پاسخ هوش مصنوعی** ({model}):\n\n{final_answer}"
-    
-    # Deliver answer to user (chunked if > 3800 chars)
+
+    # Deliver to user (chunked if > 3800 chars)
     if len(full_text) <= 3800:
         edit_bale_message(chat_id, msg_id, full_text, bale_token)
     else:
@@ -482,7 +466,85 @@ def main():
         except Exception as e:
             print(f"[History Update Note] Could not update worker history: {e}", file=sys.stderr, flush=True)
 
-    print("[Agent Finished Successfully]", flush=True)
+    print(f"[Job Finished Successfully for Chat {chat_id}]", flush=True)
+
+# ──────────────── Main Runner & Daemon Loop ────────────────
+def main():
+    bale_token = os.environ.get("BALE_BOT_TOKEN", "").strip()
+    opencode_key = os.environ.get("OPENCODE_API_KEY", "").strip()
+    worker_url = os.environ.get("WORKER_URL", "").strip()
+    initial_job = None
+
+    # Read from event payload if present
+    event_path = os.environ.get("GITHUB_EVENT_PATH")
+    if event_path and os.path.exists(event_path):
+        try:
+            with open(event_path, "r", encoding="utf-8") as f:
+                event_data = json.load(f)
+            payload = event_data.get("client_payload", {})
+            if payload.get("question"):
+                initial_job = {
+                    "question": str(payload.get("question", "")).strip(),
+                    "model": str(payload.get("model", "")).strip() or "mimo-v2.6-flash-free",
+                    "chat_id": str(payload.get("chat_id", "")).strip(),
+                    "msg_id": str(payload.get("msg_id", "")).strip(),
+                    "group_chat_id": str(payload.get("group_chat_id", "")).strip(),
+                    "history": payload.get("history") or []
+                }
+            if payload.get("worker_url"):
+                worker_url = payload["worker_url"].strip()
+        except Exception as e:
+            print(f"[Event Read Warning] {e}", file=sys.stderr)
+
+    if not initial_job and os.environ.get("QUESTION"):
+        initial_job = {
+            "question": os.environ.get("QUESTION", "").strip(),
+            "model": os.environ.get("MODEL", "").strip() or "mimo-v2.6-flash-free",
+            "chat_id": os.environ.get("CHAT_ID", "").strip(),
+            "msg_id": os.environ.get("MSG_ID", "").strip(),
+            "group_chat_id": os.environ.get("GROUP_CHAT_ID", "").strip(),
+            "history": []
+        }
+
+    # Process initial job if provided
+    if initial_job and initial_job.get("question"):
+        print("[Runner] Processing initial dispatch job...", flush=True)
+        try:
+            process_job(initial_job, bale_token, opencode_key, worker_url)
+        except Exception as e:
+            print(f"[Initial Job Error] {e}", file=sys.stderr, flush=True)
+
+    # Now enter the long-running runner daemon loop (up to 5.3 hours)
+    if not worker_url:
+        print("[Runner] No WORKER_URL specified, exiting.", flush=True)
+        return
+
+    print(f"[Runner Daemon Started] Polling {worker_url}/ai-poll for incoming chats (5.3 hour lifespan)...", flush=True)
+    start_time = time.time()
+    MAX_LIFESPAN = 5.3 * 3600  # 5 hours and 18 minutes
+
+    poll_fail_count = 0
+    while time.time() - start_time < MAX_LIFESPAN:
+        try:
+            poll_url = f"{worker_url.rstrip('/')}/ai-poll"
+            req = urllib.request.Request(poll_url, headers={"User-Agent": "GitHubActions-AIRunner/1.0"})
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+                poll_fail_count = 0
+                job = data.get("job")
+                if job and isinstance(job, dict) and job.get("question"):
+                    process_job(job, bale_token, opencode_key, worker_url)
+                    continue
+        except Exception as e:
+            poll_fail_count += 1
+            if poll_fail_count % 30 == 0:
+                print(f"[Poll Notice] Repeated poll network error: {e}", file=sys.stderr, flush=True)
+            time.sleep(2.0)
+            continue
+
+        time.sleep(1.2)
+
+    print("[Runner Daemon Finished] Lifespan limit reached. Exiting cleanly to allow fresh runner next time.", flush=True)
 
 if __name__ == "__main__":
     try:
@@ -491,12 +553,4 @@ if __name__ == "__main__":
         print(f"[FATAL AGENT ERROR] {e}", file=sys.stderr, flush=True)
         import traceback
         traceback.print_exc()
-        try:
-            cid = os.environ.get("CHAT_ID", "").strip()
-            mid = os.environ.get("MSG_ID", "").strip()
-            btok = os.environ.get("BALE_BOT_TOKEN", "").strip()
-            if cid and btok:
-                edit_bale_message(cid, mid, f"❌ خطا در پردازش درخواست هوش مصنوعی: {e}", btok)
-        except Exception:
-            pass
         sys.exit(1)

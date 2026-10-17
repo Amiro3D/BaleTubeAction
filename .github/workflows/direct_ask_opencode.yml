@@ -4,10 +4,14 @@ on:
   repository_dispatch:
     types: [bale_ask]
 
+concurrency:
+  group: bale-ai-runner
+  cancel-in-progress: false
+
 jobs:
   ask:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 340
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
