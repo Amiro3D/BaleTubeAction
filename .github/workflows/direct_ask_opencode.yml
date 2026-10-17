@@ -8,6 +8,9 @@ concurrency:
   group: bale-ai-runner
   cancel-in-progress: false
 
+permissions:
+  contents: write
+
 jobs:
   ask:
     runs-on: ubuntu-latest
@@ -15,6 +18,9 @@ jobs:
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+        token: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Set up Python
       uses: actions/setup-python@v5
@@ -23,18 +29,23 @@ jobs:
 
     - name: Install dependencies
       run: |
+        sudo apt-get update -qq && sudo apt-get install -y ffmpeg jq > /dev/null 2>&1 || true
         pip install --upgrade pip
         pip install -r requirements.txt
 
     - name: Run AI Agent
       env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         BALE_BOT_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
         OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+        GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS || '' }}
         QUESTION: ${{ github.event.client_payload.question }}
         MODEL: ${{ github.event.client_payload.model || 'mimo-v2.6-flash-free' }}
         CHAT_ID: ${{ github.event.client_payload.chat_id }}
         MSG_ID: ${{ github.event.client_payload.msg_id || '' }}
         GROUP_CHAT_ID: ${{ github.event.client_payload.group_chat_id || '' }}
+        TOPIC_ID: ${{ github.event.client_payload.topic_id || 'main' }}
+        TOPIC_TITLE: ${{ github.event.client_payload.topic_title || 'گفتگوی عمومی' }}
         WORKER_URL: ${{ secrets.WORKER_URL || 'https://balebot.ame315898036.workers.dev' }}
       run: |
         python3 .github/scripts/ai_agent.py
