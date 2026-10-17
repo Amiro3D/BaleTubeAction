@@ -950,12 +950,17 @@ def main():
     MAX_LIFESPAN = 5.3 * 3600  # 5 hours and 18 minutes
 
     poll_fail_count = 0
+    last_hb_time = 0.0
     while time.time() - start_time < MAX_LIFESPAN:
         try:
-            poll_url = f"{worker_url.rstrip('/')}/ai-poll"
+            now = time.time()
+            send_hb = (now - last_hb_time >= 60.0)
+            poll_url = f"{worker_url.rstrip('/')}/ai-poll" + ("?hb=1" if send_hb else "")
             req = urllib.request.Request(poll_url, headers={"User-Agent": "GitHubActions-AIRunner/1.0"})
             with urllib.request.urlopen(req, timeout=12) as resp:
                 data = json.loads(resp.read().decode('utf-8'))
+                if send_hb:
+                    last_hb_time = now
                 poll_fail_count = 0
                 job = data.get("job")
                 if job and isinstance(job, dict) and job.get("question"):
@@ -965,10 +970,10 @@ def main():
             poll_fail_count += 1
             if poll_fail_count % 30 == 0:
                 print(f"[Poll Notice] Repeated poll network error: {e}", file=sys.stderr, flush=True)
-            time.sleep(2.0)
+            time.sleep(3.0)
             continue
 
-        time.sleep(1.2)
+        time.sleep(2.5)
 
     print("[Runner Daemon Finished] Lifespan limit reached. Exiting cleanly to allow fresh runner next time.", flush=True)
 
