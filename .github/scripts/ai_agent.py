@@ -1061,7 +1061,12 @@ def process_job(job_data, bale_token, opencode_key, worker_url):
     print(f"\n[Agent Processing] Chat: {chat_id}, Topic: {topic_title} ({topic_id}), Model: {model}, Question: {question[:80]}", flush=True)
 
     sys_prompt = (
-        "You are 'Mr.3D Super Agent', an advanced autonomous AI software engineer and intelligent assistant running on an Ubuntu runner with full terminal and disk access for Bale messenger.\n\n"
+        "You are 'Mr.3D Super Agent', an advanced autonomous software engineering AI agent (similar to Claude Code / Cursor agent) running live on an Ubuntu Linux container for Bale messenger.\n\n"
+        "CRITICAL RULES ON CAPABILITIES:\n"
+        "- YOU HAVE FULL REAL CODE EXECUTION AND TERMINAL ACCESS. You are NOT a restricted text-only AI.\n"
+        "- NEVER say 'I cannot execute code', 'I am just a language model', or 'I cannot perform tasks'. You have real executable tools (bash, write, read, edit, glob, grep, etc.).\n"
+        "- When the user asks if you can code, run tasks, test scripts, or execute commands, ALWAYS affirm that YES, you can execute code and run bash commands directly in your Ubuntu environment.\n"
+        "- When asked to write, run, or test code or perform a task, PROACTIVELY call the appropriate tool ('bash', 'write', etc.) to execute it and show the actual output from the terminal.\n\n"
         "WORKSPACES & ARCHITECTURE:\n"
         "1. Ephemeral Scratch Workspace: '/tmp/agent_scratch' or runner local filesystem. Use this for scratch files, running tests, compiling scripts, downloading temporary data, and experimenting.\n"
         "2. Persistent Workspace: 'agent_workspace/{chat_id}/'. Use the 'manage_persistent_workspace' tool to write or modify files here. Anything saved here is committed to Git and pushed to GitHub so it stays permanently available across sessions!\n"
@@ -1319,6 +1324,18 @@ def process_job(job_data, bale_token, opencode_key, worker_url):
 
     print(f"[Job Finished Successfully for Chat {chat_id}, Topic {topic_id}]", flush=True)
 
+def check_for_code_update():
+    try:
+        subprocess.run(["git", "fetch", "origin", "main"], check=False, timeout=15)
+        local_hash = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+        remote_hash = subprocess.check_output(["git", "rev-parse", "origin/main"], text=True).strip()
+        if local_hash != remote_hash:
+            print(f"[Runner Auto-Update] New commit detected ({local_hash[:7]} -> {remote_hash[:7]}). Pulling & restarting...", flush=True)
+            subprocess.run(["git", "pull", "--rebase", "origin", "main"], check=False, timeout=20)
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+    except Exception as e:
+        print(f"[Auto-Update Check Note] {e}", file=sys.stderr)
+
 # ──────────────── Main Runner & Daemon Loop ────────────────
 def main():
     ensure_git_config()
@@ -1381,9 +1398,14 @@ def main():
 
     poll_fail_count = 0
     last_hb_time = 0.0
+    last_update_check = 0.0
     while time.time() - start_time < MAX_LIFESPAN:
         try:
             now = time.time()
+            if now - last_update_check >= 120.0:
+                last_update_check = now
+                check_for_code_update()
+
             send_hb = (now - last_hb_time >= 60.0)
             poll_url = f"{worker_url.rstrip('/')}/ai-poll" + ("?hb=1" if send_hb else "")
             req = urllib.request.Request(poll_url, headers={"User-Agent": "GitHubActions-AIRunner/1.0"})
