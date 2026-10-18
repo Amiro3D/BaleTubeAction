@@ -591,6 +591,52 @@ def run_upload_to_gdrive(file_path: str, drive_folder_id: str, chat_id: str) -> 
     except Exception as e:
         return f"خطا در ارتباط با گوگل درایو: {e}"
 
+def run_send_file_to_user(filepath: str, caption: str, chat_id: str, bale_token: str) -> str:
+    """Sends any generated file (photo, document, audio, video) directly to the user in Bale."""
+    print(f"[Agent Tool: send_file_to_user] {filepath}", flush=True)
+    if not filepath:
+        return "Error: filepath is required."
+    candidates = [
+        filepath,
+        os.path.join(os.getcwd(), filepath),
+        os.path.join("/tmp/agent_scratch", os.path.basename(filepath)),
+        os.path.join(os.getcwd(), "agent_workspace", str(chat_id), os.path.basename(filepath)),
+        os.path.join("/tmp", os.path.basename(filepath))
+    ]
+    target = None
+    for c in candidates:
+        if os.path.exists(c) and os.path.isfile(c):
+            target = c
+            break
+            
+    if not target:
+        return f"Error: File '{filepath}' does not exist on disk."
+        
+    base = os.path.basename(target)
+    ext = os.path.splitext(base)[1].lower()
+    
+    if ext in [".jpg", ".jpeg", ".png", ".webp", ".gif"]:
+        method = "sendPhoto"
+        field = "photo"
+    elif ext in [".mp4", ".mov", ".mkv", ".webm"]:
+        method = "sendVideo"
+        field = "video"
+    elif ext in [".mp3", ".m4a", ".wav", ".ogg"]:
+        method = "sendAudio"
+        field = "audio"
+    else:
+        method = "sendDocument"
+        field = "document"
+        
+    final_caption = caption or f"📁 **{base}**\n🤖 ارسال شده توسط دستیار Mr.3D"
+    res = send_bale_file(method, chat_id, target, final_caption, field, bale_token)
+    if not (res and res.get("ok")) and method != "sendDocument":
+        res = send_bale_file("sendDocument", chat_id, target, final_caption, "document", bale_token)
+        
+    if res and res.get("ok"):
+        return f"فایل '{base}' با موفقیت در چت بله برای کاربر ارسال گردید."
+    return f"فایل پیدا شد اما ارسال به چت بله ناموفق بود: {res}"
+
 # ──────────────── Tool Definitions for OpenCode Zen ────────────────
 TOOLS = [
     {
@@ -782,6 +828,21 @@ TOOLS = [
                 "properties": {
                     "file_path": {"type": "string", "description": "Path or filename in workspace to upload"},
                     "drive_folder_id": {"type": "string", "description": "Optional Google Drive folder ID"}
+                },
+                "required": ["file_path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_file_to_user",
+            "description": "Send any local file (image, photo, document, script, video, audio) directly to the user in Bale messenger chat.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "Local path or filename of the file to send (e.g. '/tmp/agent_scratch/image.png' or 'agent_workspace/...')."},
+                    "caption": {"type": "string", "description": "Optional message caption in Persian to accompany the file."}
                 },
                 "required": ["file_path"]
             }
@@ -1094,11 +1155,13 @@ def process_job(job_data, bale_token, opencode_key, worker_url):
         "- 'generate_image': Generate high quality AI images with Flux and send directly to Bale.\n"
         "- 'take_screenshot': Capture website screenshots and send to Bale.\n"
         "- 'manage_persistent_workspace': Read, write, list, or delete permanent files in repository across sessions.\n"
-        "- 'upload_to_gdrive': Upload files to Google Drive and provide a shareable download link.\n\n"
+        "- 'upload_to_gdrive': Upload files to Google Drive and provide a shareable download link.\n"
+        "- 'send_file_to_user': Send ANY generated file (image, photo, PDF, document, script, video, audio) directly to the user in Bale messenger.\n\n"
         "OPERATIONAL PRINCIPLES:\n"
         "- Always respond in natural, fluent Persian (Farsi) unless the user requests another language.\n"
-        "- Act autonomously: chain tools proactively (e.g. search -> write code -> test with bash -> fix -> save) until the user's objective is fully accomplished.\n"
-        "- After tool executions complete, formulate a comprehensive, polite Persian response explaining what was done and the final results."
+        "- Act autonomously: chain tools proactively (e.g. search -> write code -> test with bash -> send file -> save) until the user's objective is fully accomplished.\n"
+        "- After tool executions complete, formulate a comprehensive, polite Persian response explaining what was done and the final results.\n"
+        "- CRITICAL OUTPUT RULE: NEVER output internal English thought monologues (e.g. 'The user wants...', 'Let me summarize...', 'Let me execute...'). Write directly and politely to the user in Persian."
     )
 
     messages = [{"role": "system", "content": sys_prompt}]
@@ -1251,6 +1314,14 @@ def process_job(job_data, bale_token, opencode_key, worker_url):
                     tool_output = run_upload_to_gdrive(fp, fid, chat_id)
                     tool_results_log.append(f"گوگل درایو: {tool_output}")
 
+                # 14. SEND FILE DIRECTLY TO USER IN BALE
+                elif tc_name == "send_file_to_user":
+                    fp = tc_args.get("file_path") or tc_args.get("filePath") or ""
+                    cap = tc_args.get("caption") or ""
+                    edit_bale_message(chat_id, msg_id, f"📤 **در حال ارسال فایل به چت بله...**\n`{os.path.basename(fp)}`", bale_token)
+                    tool_output = run_send_file_to_user(fp, cap, chat_id, bale_token)
+                    tool_results_log.append(f"ارسال فایل به کاربر: {tool_output}")
+
                 else:
                     tool_output = "عملیات با موفقیت انجام شد."
 
@@ -1265,23 +1336,52 @@ def process_job(job_data, bale_token, opencode_key, worker_url):
                 edit_bale_message(chat_id, msg_id, "✍️ **در حال جمع‌بندی نهایی و نگارش پاسخ...**", bale_token)
                 messages.append({
                     "role": "user",
-                    "content": "با توجه به تمام ابزارهای اجرا شده و نتایج آن‌ها، پاسخ نهایی و کامل را به زبان فارسی ارائه بده."
+                    "content": "با توجه به تمام ابزارهای اجرا شده و نتایج آن‌ها، پاسخ نهایی و کامل را به زبان فارسی ارائه بده. از آوردن افکار درونی انگلیسی خودداری کن."
                 })
         else:
             final_answer = content.strip() or reasoning.strip()
             break
 
-    # If final answer is empty but tools executed, synthesize
-    if not final_answer and tool_results_log:
-        print("[Agent Fallback] Synthesizing answer from tool results...", flush=True)
+    def is_internal_monologue(text: str) -> bool:
+        if not text:
+            return True
+        cleaned = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+        if not cleaned:
+            return True
+        monologue_patterns = [
+            r'(?i)^\s*(The user wants|Let me|I need to|In my thinking|Thinking Process:|First, let me|We should)',
+            r'(?i)^\s*(Let me summarize what was done|Let me execute|I haven\'t yet|The user asked for)',
+        ]
+        for pat in monologue_patterns:
+            if re.search(pat, cleaned):
+                return True
+        return False
+
+    def clean_final_answer(text: str) -> str:
+        if not text:
+            return ""
+        text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+        hdr = text.rfind('**Answer**')
+        if hdr != -1 and re.search(r'\*\*Reasoning|Reasoning and information|Reasoning used', text[:hdr], re.IGNORECASE):
+            text = text[hdr + len('**Answer**'):].strip()
+        text = re.sub(r'(?i)^\s*thinking process:.*?(?=\n\n|\Z)', '', text, flags=re.DOTALL).strip()
+        return text.strip()
+
+    final_answer = clean_final_answer(final_answer)
+
+    # If final answer is empty OR is clearly an internal monologue/reasoning, synthesize!
+    if is_internal_monologue(final_answer) or (not final_answer and tool_results_log):
+        print("[Agent Synthesis] Synthesizing clean Persian final answer...", flush=True)
         edit_bale_message(chat_id, msg_id, "✍️ **در حال جمع‌بندی نهایی...**", bale_token)
         synth_msgs = [
-            {"role": "system", "content": "You are a helpful Persian AI assistant named Mr.3D Super Agent. Answer the user comprehensively in Persian based on the actions taken and results."},
-            {"role": "user", "content": f"درخواست کاربر: {question}\n\nاقدامات انجام شده:\n" + "\n\n".join(tool_results_log[:8]) + "\n\nپاسخ نهایی، مستند و شیوا را به زبان فارسی بنویس."}
+            {"role": "system", "content": "You are Mr.3D Super Agent, a polite and capable Persian assistant. Your task is to provide the final polite user-facing answer in Persian. NEVER output internal thoughts, planning, or English monologues. Explain clearly what actions were taken and what the result is."},
+            {"role": "user", "content": f"درخواست کاربر: {question}\n\nگزارش اقدامات و ابزارهای اجرا شده:\n" + "\n\n".join(tool_results_log[:8]) + "\n\nپاسخ نهایی، مستند و شیوا را مستقیماً به کاربر به زبان فارسی تحویل بده."}
         ]
-        synth_res = call_opencode_stream(synth_msgs, "nemotron-3.5-lightning-free", session_key=session_key, tools_override=[], initial_key=opencode_key)
+        synth_res = call_opencode_stream(synth_msgs, "nemotron-3.5-lightning-free", session_key=f"synth_{session_key}", tools_override=[], initial_key=opencode_key)
         if synth_res.get("ok"):
-            final_answer = synth_res.get("content", "").strip() or synth_res.get("reasoning", "").strip()
+            cand = clean_final_answer(synth_res.get("content", "").strip())
+            if cand and not is_internal_monologue(cand):
+                final_answer = cand
 
     # Emergency fallback
     if not final_answer:
@@ -1290,16 +1390,11 @@ def process_job(job_data, bale_token, opencode_key, worker_url):
             {"role": "user", "content": question}
         ], "nemotron-3.5-lightning-free", session_key=session_key, tools_override=[], initial_key=opencode_key)
         if em_res.get("ok"):
-            final_answer = em_res.get("content", "").strip()
+            final_answer = clean_final_answer(em_res.get("content", "").strip())
 
     if not final_answer:
         edit_bale_message(chat_id, msg_id, "❌ متأسفانه دریافت پاسخ از سرور هوش مصنوعی با خطا مواجه شد. لطفاً دوباره پیام خود را بفرستید.", bale_token)
         return
-
-    # Strip leaked reasoning headers if any
-    hdr = final_answer.rfind('**Answer**')
-    if hdr != -1 and re.search(r'\*\*Reasoning|Reasoning and information|Reasoning used', final_answer[:hdr], re.IGNORECASE):
-        final_answer = final_answer[hdr + len('**Answer**'):].strip()
 
     full_text = f"🤖 **پاسخ دستیار Mr.3D** ({model}):\n\n{final_answer}"
 
