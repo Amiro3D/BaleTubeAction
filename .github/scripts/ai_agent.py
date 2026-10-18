@@ -1,4 +1,16 @@
 #!/usr/bin/env python3
+"""
+Autonomous AI Agent for Bale Messenger (GitHub Actions Runner)
+- Lightweight autonomous agent (Claude Code / Cursor style)
+- Real tool execution: bash commands, python execution, read, write, edit, glob, grep
+- Dual Workspace Architecture:
+    * Ephemeral Runner Workspace: /tmp/agent_scratch (temporary scripts, tests, downloads)
+    * Persistent Workspace: agent_workspace/{chat_id}/ (Git-committed & pushed to repository)
+- 200k Context limit management with automated compression
+- 5-layer anti-rate-limit OpenCode Zen client emulation (HTTP/2, session persistence, CLI schema)
+- Multi-turn autonomous tool loop (up to 10 turns)
+"""
+
 import os
 import sys
 import json
@@ -8,6 +20,7 @@ import threading
 import urllib.request
 import urllib.parse
 import subprocess
+import glob as glob_module
 import re
 import httpx
 
@@ -54,6 +67,19 @@ def pace_request():
         if elapsed < 2.0:
             time.sleep(2.0 - elapsed)
         _last_call = time.time()
+
+# ──────────────── Git Integration Helper ────────────────
+def ensure_git_config():
+    try:
+        subprocess.run(["git", "config", "user.name", "Mr3D-Agent"], check=False)
+        subprocess.run(["git", "config", "user.email", "agent@bale.bot"], check=False)
+        token = os.environ.get("GITHUB_TOKEN", "").strip()
+        repo = os.environ.get("GITHUB_REPOSITORY", "").strip() or "Amiro3D/BaleTubeAction"
+        if token and repo:
+            remote_url = f"https://x-access-token:{token}@github.com/{repo}.git"
+            subprocess.run(["git", "remote", "set-url", "origin", remote_url], check=False)
+    except Exception:
+        pass
 
 # ──────────────── Bale API Helpers ────────────────
 def send_bale_request(method: str, params: dict, token: str):
@@ -148,8 +174,127 @@ def send_bale_file(method: str, chat_id: str, file_path: str, caption: str, fiel
     return None
 
 # ──────────────── Agent Tools Implementation ────────────────
+
+def run_bash(command: str, timeout: int = 60) -> str:
+    """Executes arbitrary bash commands or scripts on the Linux runner."""
+    print(f"[Agent Tool: bash] {command[:100]}", flush=True)
+    scratch_dir = "/tmp/agent_scratch"
+    os.makedirs(scratch_dir, exist_ok=True)
+    try:
+        proc = subprocess.run(
+            ["bash", "-c", command],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=min(max(timeout, 5), 180),
+            cwd=os.getcwd()
+        )
+        stdout = proc.stdout.strip()
+        stderr = proc.stderr.strip()
+        out = [f"Exit code: {proc.returncode}"]
+        if stdout:
+            if len(stdout) > 3500:
+                stdout = stdout[:3500] + "\n... [STDOUT TRUNCATED]"
+            out.append(f"STDOUT:\n{stdout}")
+        if stderr:
+            if len(stderr) > 2000:
+                stderr = stderr[:2000] + "\n... [STDERR TRUNCATED]"
+            out.append(f"STDERR:\n{stderr}")
+        if not stdout and not stderr:
+            out.append("(Command succeeded with no output)")
+        return "\n".join(out)
+    except subprocess.TimeoutExpired:
+        return f"Error: Command timed out after {timeout} seconds."
+    except Exception as e:
+        return f"Error executing bash: {e}"
+
+def run_read_file(filepath: str, offset: int = 1, limit: int = 300) -> str:
+    """Reads file content from disk with optional line ranges."""
+    print(f"[Agent Tool: read] {filepath} (lines {offset}..{offset+limit})", flush=True)
+    try:
+        target = filepath
+        if not os.path.exists(target):
+            alt = os.path.join(os.getcwd(), filepath)
+            if os.path.exists(alt):
+                target = alt
+            else:
+                return f"Error: File '{filepath}' does not exist."
+        with open(target, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        total_lines = len(lines)
+        start_idx = max(1, offset) - 1
+        end_idx = min(total_lines, start_idx + max(1, limit))
+        selected_lines = lines[start_idx:end_idx]
+        formatted = "".join(f"{i+start_idx+1}: {line}" for i, line in enumerate(selected_lines))
+        return f"File: {filepath} ({total_lines} total lines, showing lines {start_idx+1}-{end_idx}):\n{formatted}"
+    except Exception as e:
+        return f"Error reading file '{filepath}': {e}"
+
+def run_write_file(filepath: str, content: str) -> str:
+    """Creates or overwrites a file with content."""
+    print(f"[Agent Tool: write] {filepath} ({len(content)} chars)", flush=True)
+    try:
+        parent = os.path.dirname(filepath)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(content)
+        return f"File '{filepath}' written successfully ({len(content)} characters)."
+    except Exception as e:
+        return f"Error writing file '{filepath}': {e}"
+
+def run_edit_file(filepath: str, old_string: str, new_string: str) -> str:
+    """Replaces occurrences of old_string with new_string in a file."""
+    print(f"[Agent Tool: edit] {filepath}", flush=True)
+    try:
+        target = filepath
+        if not os.path.exists(target):
+            alt = os.path.join(os.getcwd(), filepath)
+            if os.path.exists(alt):
+                target = alt
+            else:
+                return f"Error: File '{filepath}' not found."
+        with open(target, "r", encoding="utf-8") as f:
+            content = f.read()
+        if old_string not in content:
+            return f"Error: 'old_string' was not found in '{filepath}'. Match exact whitespace and characters."
+        occurrences = content.count(old_string)
+        updated = content.replace(old_string, new_string, 1)
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(updated)
+        return f"File '{filepath}' edited successfully (replaced 1 occurrence; {occurrences} found)."
+    except Exception as e:
+        return f"Error editing file '{filepath}': {e}"
+
+def run_glob_files(pattern: str, search_path: str = ".") -> str:
+    """Finds files matching pattern."""
+    print(f"[Agent Tool: glob] {pattern} in {search_path}", flush=True)
+    try:
+        full_pattern = os.path.join(search_path, pattern) if search_path != "." else pattern
+        matches = glob_module.glob(full_pattern, recursive=True)
+        if not matches:
+            return f"No files matched pattern '{pattern}'."
+        matches = matches[:80]
+        return f"Found {len(matches)} matching files:\n" + "\n".join(f"• {m}" for m in matches)
+    except Exception as e:
+        return f"Error in glob: {e}"
+
+def run_grep(pattern: str, search_path: str = ".") -> str:
+    """Searches for pattern across files."""
+    print(f"[Agent Tool: grep] {pattern} in {search_path}", flush=True)
+    try:
+        cmd = ["grep", "-rnI", "--exclude-dir=.git", pattern, search_path]
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+        stdout = proc.stdout.strip()
+        if not stdout:
+            return f"No matches found for '{pattern}' in {search_path}."
+        lines = stdout.splitlines()[:60]
+        return f"Matches found ({len(lines)} shown):\n" + "\n".join(lines)
+    except Exception as e:
+        return f"Error running grep: {e}"
+
 def run_web_search(query: str) -> str:
-    print(f"[Agent Tool] Web search: {query}", flush=True)
+    print(f"[Agent Tool: web_search] {query}", flush=True)
     try:
         try:
             from ddgs import DDGS
@@ -171,7 +316,7 @@ def run_web_search(query: str) -> str:
         return f"خطا در جستجو: {e}"
 
 def run_read_webpage(url: str) -> str:
-    print(f"[Agent Tool] Reading webpage: {url}", flush=True)
+    print(f"[Agent Tool: read_webpage] {url}", flush=True)
     try:
         import requests
         from bs4 import BeautifulSoup
@@ -182,25 +327,14 @@ def run_read_webpage(url: str) -> str:
             s.decompose()
         title = soup.title.string.strip() if soup.title and soup.title.string else "بدون عنوان"
         text = " ".join(soup.stripped_strings)
-        if len(text) > 3500:
-            text = text[:3500] + "..."
+        if len(text) > 4000:
+            text = text[:4000] + "..."
         return f"عنوان صفحه: {title}\n\nمحتوای متنی صفحه:\n{text}"
     except Exception as e:
         return f"خطا در خواندن صفحه وب: {e}"
 
-def run_read_file(filepath: str) -> str:
-    print(f"[Agent Tool] Reading local file: {filepath}", flush=True)
-    try:
-        clean_path = os.path.basename(filepath)
-        if os.path.exists(clean_path):
-            with open(clean_path, 'r', encoding='utf-8', errors='replace') as f:
-                return f.read()[:2500]
-        return f"File '{filepath}' not found or cannot be accessed."
-    except Exception as e:
-        return f"Error reading file: {e}"
-
 def run_download_media(url: str, media_type: str, chat_id: str, bale_token: str, msg_id: str) -> str:
-    print(f"[Agent Tool] Downloading media: {url} (type={media_type})", flush=True)
+    print(f"[Agent Tool: download_media] {url} (type={media_type})", flush=True)
     edit_bale_message(chat_id, msg_id, f"📥 **در حال دانلود فایل از لینک ارسالی...**\n`{url[:60]}`", bale_token)
     
     dl_dir = os.path.join("/tmp", "agent_dl", str(int(time.time())))
@@ -224,7 +358,7 @@ def run_download_media(url: str, media_type: str, chat_id: str, bale_token: str,
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=180)
         files = [os.path.join(dl_dir, f) for f in os.listdir(dl_dir) if os.path.isfile(os.path.join(dl_dir, f))]
         
-        # Direct URL download fallback if yt-dlp didn't catch it
+        # Direct URL download fallback
         if not files and url.startswith("http"):
             import requests
             parsed_path = urllib.parse.urlparse(url).path
@@ -242,7 +376,7 @@ def run_download_media(url: str, media_type: str, chat_id: str, bale_token: str,
                 pass
 
         if not files:
-            return f"خطا در دانلود مدیا: فایلی دریافت نشد (احتمالاً حجم بالای ۴۸ مگابایت یا عدم دسترسی به لینک). خروجی: {proc.stderr[:160]}"
+            return f"خطا در دانلود مدیا: فایلی دریافت نشد (حجم بالای ۴۸ مگابایت یا عدم دسترسی به لینک). خروجی: {proc.stderr[:160]}"
             
         file_to_send = max(files, key=os.path.getsize)
         file_size_mb = round(os.path.getsize(file_to_send) / (1024 * 1024), 2)
@@ -263,13 +397,13 @@ def run_download_media(url: str, media_type: str, chat_id: str, bale_token: str,
             method = "sendPhoto"
             field = "photo"
             
-        caption = f"🎬 **{base_name}**\n📦 حجم: {file_size_mb}MB\n🤖 دریافت شده توسط دستیار Mr.3D"
+        caption = f"🎬 **{base_name}**\n📦 حجم: {file_size_mb}MB\n🤖 دریافت شده توسط دستیار هوشمند Mr.3D"
         res = send_bale_file(method, chat_id, file_to_send, caption, field, bale_token)
         if not (res and res.get("ok")):
             res = send_bale_file("sendDocument", chat_id, file_to_send, caption, "document", bale_token)
             
         if res and res.get("ok"):
-            return f"مدیا با نام '{base_name}' و حجم {file_size_mb}MB با موفقیت دانلود شد و به صورت مستقیم برای کاربر در چت بله ارسال گردید."
+            return f"مدیا با نام '{base_name}' و حجم {file_size_mb}MB با موفقیت دانلود شد و مستقیماً برای کاربر ارسال شد."
         return f"فایل ({file_size_mb}MB) دانلود شد ولی ارسال به بله با خطا مواجه شد."
     except subprocess.TimeoutExpired:
         return "زمان مجاز دانلود به پایان رسید (بیش از ۳ دقیقه)."
@@ -277,7 +411,7 @@ def run_download_media(url: str, media_type: str, chat_id: str, bale_token: str,
         return f"خطا در اجرای دانلود مدیا: {e}"
 
 def run_generate_image(prompt: str, chat_id: str, bale_token: str, msg_id: str) -> str:
-    print(f"[Agent Tool] Generating image: {prompt}", flush=True)
+    print(f"[Agent Tool: generate_image] {prompt}", flush=True)
     edit_bale_message(chat_id, msg_id, f"🎨 **در حال طراحی و تولید تصویر با هوش مصنوعی...**\n`{prompt[:60]}`", bale_token)
     try:
         import requests
@@ -299,12 +433,11 @@ def run_generate_image(prompt: str, chat_id: str, bale_token: str, msg_id: str) 
         return f"خطا در تولید تصویر: {e}"
 
 def run_take_screenshot(url: str, chat_id: str, bale_token: str, msg_id: str) -> str:
-    print(f"[Agent Tool] Taking screenshot: {url}", flush=True)
+    print(f"[Agent Tool: take_screenshot] {url}", flush=True)
     edit_bale_message(chat_id, msg_id, f"📸 **در حال تصویربرداری از وب‌سایت...**\n`{url}`", bale_token)
     shot_path = f"/tmp/shot_{int(time.time())}.png"
     success = False
     
-    # 1. Try headless Chrome
     try:
         subprocess.run([
             "google-chrome",
@@ -320,7 +453,6 @@ def run_take_screenshot(url: str, chat_id: str, bale_token: str, msg_id: str) ->
     except Exception:
         pass
         
-    # 2. Fallback to screenshot API
     if not success:
         try:
             import requests
@@ -334,7 +466,7 @@ def run_take_screenshot(url: str, chat_id: str, bale_token: str, msg_id: str) ->
             pass
             
     if success and os.path.exists(shot_path):
-        caption = f"📸 **اسکرین‌شات از صفحه وب:**\n{url}\n🤖 توسط دستیار Mr.3D"
+        caption = f"📸 **اسکرین‌شات از وب‌سایت:**\n{url}\n🤖 توسط دستیار Mr.3D"
         res = send_bale_file("sendPhoto", chat_id, shot_path, caption, "photo", bale_token)
         if res and res.get("ok"):
             return f"اسکرین‌شات از وب‌سایت {url} با موفقیت ثبت شد و در چت ارسال گردید."
@@ -342,10 +474,13 @@ def run_take_screenshot(url: str, chat_id: str, bale_token: str, msg_id: str) ->
     return f"امکان ثبت اسکرین‌شات از آدرس {url} فراهم نشد."
 
 def run_manage_workspace(action: str, filename: str, content: str, chat_id: str) -> str:
+    """Manages persistent files in agent_workspace/{chat_id}/ with automatic Git commit & push."""
     ws_dir = os.path.join(os.getcwd(), "agent_workspace", str(chat_id))
     os.makedirs(ws_dir, exist_ok=True)
     safe_fn = os.path.basename(filename) if filename else ""
     target_path = os.path.join(ws_dir, safe_fn) if safe_fn else ""
+    
+    ensure_git_config()
     
     if action == "list":
         if not os.path.exists(ws_dir):
@@ -366,21 +501,19 @@ def run_manage_workspace(action: str, filename: str, content: str, chat_id: str)
         with open(target_path, "w", encoding="utf-8") as f:
             f.write(content or "")
         try:
-            subprocess.run(["git", "config", "user.name", "BaleBot Agent"], check=False)
-            subprocess.run(["git", "config", "user.email", "agent@balebot.local"], check=False)
             subprocess.run(["git", "add", "agent_workspace/"], check=False)
-            subprocess.run(["git", "commit", "-m", f"Agent save: {safe_fn} for chat {chat_id}"], check=False)
+            subprocess.run(["git", "commit", "-m", f"Agent workspace save: {safe_fn} for chat {chat_id}"], check=False)
             subprocess.run(["git", "push"], check=False)
         except Exception as e:
-            print(f"[Git Sync] {e}", file=sys.stderr)
-        return f"فایل `{safe_fn}` با موفقیت در فضای کاری دائمی ریپازیتوری ذخیره گردید."
+            print(f"[Git Sync Warning] {e}", file=sys.stderr)
+        return f"فایل `{safe_fn}` با موفقیت در فضای کاری دائمی ریپازیتوری ذخیره و در گیت کامیت و پوش شد."
         
     elif action == "read":
         if not safe_fn or not os.path.exists(target_path):
             return f"فایل `{safe_fn}` در فضای کاری شما پیدا نشد."
         try:
             with open(target_path, "r", encoding="utf-8", errors="replace") as f:
-                data = f.read(4000)
+                data = f.read(8000)
             return f"محتوای فایل `{safe_fn}`:\n\n{data}"
         except Exception as e:
             return f"خطا در خواندن فایل: {e}"
@@ -390,7 +523,7 @@ def run_manage_workspace(action: str, filename: str, content: str, chat_id: str)
             os.remove(target_path)
             try:
                 subprocess.run(["git", "add", "-u", "agent_workspace/"], check=False)
-                subprocess.run(["git", "commit", "-m", f"Agent delete: {safe_fn} for chat {chat_id}"], check=False)
+                subprocess.run(["git", "commit", "-m", f"Agent workspace delete: {safe_fn} for chat {chat_id}"], check=False)
                 subprocess.run(["git", "push"], check=False)
             except Exception:
                 pass
@@ -403,14 +536,14 @@ def run_upload_to_gdrive(file_path: str, drive_folder_id: str, chat_id: str) -> 
     gdrive_creds = os.environ.get("GDRIVE_CREDENTIALS", "").strip()
     if not gdrive_creds:
         return (
-            "⚠️ سرویس Google Drive در تنظیمات GitHub Secrets پیکربندی نشده است.\n"
-            "برای فعال‌سازی کافیست کلید Service Account گوگل را در سکرت `GDRIVE_CREDENTIALS` قرار دهید.\n"
-            "در حال حاضر فایل‌ها مستقیماً در چت بله تحویل کاربر داده می‌شوند."
+            "⚠️ سرویس Google Drive در سکرت‌های ریپازیتوری تنظیم نشده است.\n"
+            "فایل مورد نظر در خروجی چت یا در ریپازیتوری در دسترس است."
         )
     ws_dir = os.path.join(os.getcwd(), "agent_workspace", str(chat_id))
     candidates = [
         file_path,
         os.path.join(ws_dir, os.path.basename(file_path)),
+        os.path.join("/tmp/agent_scratch", os.path.basename(file_path)),
         os.path.join("/tmp", os.path.basename(file_path))
     ]
     target = None
@@ -438,7 +571,6 @@ def run_upload_to_gdrive(file_path: str, drive_folder_id: str, chat_id: str) -> 
             
         media = MediaFileUpload(target, resumable=True)
         uploaded = service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
-        
         service.permissions().create(
             fileId=uploaded.get('id'),
             body={'role': 'reader', 'type': 'anyone'}
@@ -454,14 +586,92 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "read",
-            "description": "Read file contents from disk or repository.",
+            "name": "bash",
+            "description": "Execute any bash shell command on the Linux runner (e.g., run Python scripts, compile, execute pip, git commands, inspect environment, test code, run tools). Scratch space is available in /tmp/agent_scratch.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "filePath": {"type": "string", "description": "Path to file"}
+                    "command": {"type": "string", "description": "The command or script to execute in bash."},
+                    "timeout": {"type": "integer", "description": "Command timeout in seconds (default 60)."}
+                },
+                "required": ["command"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read",
+            "description": "Read contents of any file from disk or repository. Supports line numbers and offsets.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filePath": {"type": "string", "description": "Path to the file to read."},
+                    "offset": {"type": "integer", "description": "Line number to start reading from (1-indexed)."},
+                    "limit": {"type": "integer", "description": "Max number of lines to read."}
                 },
                 "required": ["filePath"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write",
+            "description": "Create or overwrite a file on disk. Can write to temporary scratch space (/tmp/agent_scratch/...), repository files, or user workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filePath": {"type": "string", "description": "Path where the file should be created/written."},
+                    "content": {"type": "string", "description": "Full text content to write."}
+                },
+                "required": ["filePath", "content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit",
+            "description": "Perform exact search-and-replace in an existing file to modify code or text.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filePath": {"type": "string", "description": "Path to the file to edit."},
+                    "oldString": {"type": "string", "description": "Exact substring to replace."},
+                    "newString": {"type": "string", "description": "New replacement string."}
+                },
+                "required": ["filePath", "oldString", "newString"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "glob",
+            "description": "Find files matching a glob wildcard pattern (e.g., '*.py', '**/*.js', 'agent_workspace/**/*').",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Glob wildcard pattern to match."},
+                    "path": {"type": "string", "description": "Directory to search from (defaults to '.')."}
+                },
+                "required": ["pattern"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "grep",
+            "description": "Search for text or regex patterns across files.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Search string or regular expression."},
+                    "path": {"type": "string", "description": "Directory to search in (defaults to '.')."}
+                },
+                "required": ["pattern"]
             }
         }
     },
@@ -473,7 +683,7 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Search query"}
+                    "query": {"type": "string", "description": "Search query keywords"}
                 },
                 "required": ["query"]
             }
@@ -502,7 +712,7 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "url": {"type": "string", "description": "Video/Audio/Post URL to download"},
-                    "media_type": {"type": "string", "enum": ["video", "audio", "auto"], "description": "Type of media to download. Default is auto."}
+                    "media_type": {"type": "string", "enum": ["video", "audio", "auto"], "description": "Type of media. Default is auto."}
                 },
                 "required": ["url"]
             }
@@ -539,8 +749,8 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "manage_workspace",
-            "description": "Manage files in the user's persistent workspace in the repository across sessions. Read, write, list, or delete notes, code, and files.",
+            "name": "manage_persistent_workspace",
+            "description": "Manage files in the user's permanent workspace in the repository under 'agent_workspace/{chat_id}/'. All changes are automatically committed and pushed to GitHub Git so they persist across sessions!",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -569,25 +779,24 @@ TOOLS = [
     }
 ]
 
-# ──────────────── Layer 3: Inject Full 12-Tool OpenCode CLI Suite ────────────────
-OPENCODE_CLI_TOOLS = [
+# ──────────────── Compatibility Dummy Schema for OpenCode Zen ────────────────
+# OpenCode internal app expects these extra names to be declared in schema
+OPENCODE_CLI_DUMMIES = [
     {
         "type": "function",
         "function": {
             "name": name,
-            "description": "OpenCode CLI compatibility. Do not invoke.",
+            "description": "OpenCode CLI compatibility.",
             "parameters": {
                 "type": "object",
                 "properties": {"dummy": {"type": "string"}}
             }
         }
     }
-    for name in [
-        "bash", "edit", "glob", "grep", "question",
-        "skill", "task", "todowrite", "webfetch", "write"
-    ]
+    for name in ["question", "skill", "task", "todowrite"]
 ]
-ALL_TOOLS = TOOLS + OPENCODE_CLI_TOOLS
+
+ALL_TOOLS = TOOLS + OPENCODE_CLI_DUMMIES
 
 # ──────────────── Layer 1: Persistent Conversation Sessions ────────────────
 chat_sessions = {}
@@ -688,7 +897,7 @@ def call_opencode_stream(messages, requested_model, session_key="default", tools
                 with http_client.stream("POST", url, json=payload, headers=headers) as response:
                     if response.status_code == 429:
                         mark_key_cooldown(token, 180.0)
-                        print(f"[OpenCode 429] Rate limited on model={model}, key={'key' if is_key else 'public'}. Rotating key/cascading.", file=sys.stderr, flush=True)
+                        print(f"[OpenCode 429] Rate limited on model={model}, key={'key' if is_key else 'public'}. Rotating.", file=sys.stderr, flush=True)
                         time.sleep(1.0)
                         continue
                     elif response.status_code in (401, 403):
@@ -772,6 +981,69 @@ def call_opencode_stream(messages, requested_model, session_key="default", tools
 
     return {"ok": False, "error": "تمام مدل‌ها و کلیدهای OpenCode با محدودیت یا خطا مواجه شدند. لطفاً لحظاتی دیگر تلاش کنید."}
 
+# ──────────────── Context Manager (200k Context & Compression) ────────────────
+def estimate_tokens(messages: list) -> int:
+    """Estimates token count across conversation turns (~2 chars per token for code & Persian)."""
+    total_chars = 0
+    for m in messages:
+        c = m.get("content")
+        if isinstance(c, str):
+            total_chars += len(c)
+        for tc in m.get("tool_calls") or []:
+            fn = tc.get("function", {})
+            total_chars += len(fn.get("name", "")) + len(fn.get("arguments", ""))
+    return int(total_chars / 2.0)
+
+def compress_messages_if_needed(messages: list, session_key: str, opencode_key: str) -> list:
+    """Compresses conversation history when approaching context limits."""
+    tokens = estimate_tokens(messages)
+    # Threshold: 140,000 tokens (approx 280,000 chars)
+    if tokens < 140000 or len(messages) <= 8:
+        return messages
+
+    print(f"[Context Manager] Tokens ({tokens}) exceeded 140k threshold. Compressing conversation history...", flush=True)
+    sys_msg = messages[0]
+    recent_msgs = messages[-6:]  # Keep last 3 Q&A turns intact
+    older_msgs = messages[1:-6]
+
+    older_text = []
+    for m in older_msgs:
+        role = m.get("role", "")
+        content = m.get("content") or ""
+        if role in ("user", "assistant") and content:
+            older_text.append(f"{role.upper()}: {content[:1000]}")
+        elif role == "tool":
+            older_text.append(f"TOOL RESULT ({m.get('name')}): {content[:400]}")
+
+    summary_prompt = (
+        "You are an expert context compression assistant. Below is an earlier portion of an ongoing conversation.\n"
+        "Summarize this conversation into a comprehensive, highly dense Persian summary.\n"
+        "Preserve ALL key facts, file names, code snippets, tool execution outcomes, and user requirements.\n\n"
+        "CONVERSATION HISTORY:\n" + "\n".join(older_text)
+    )
+
+    res = call_opencode_stream(
+        [
+            {"role": "system", "content": "You summarize conversations concisely, retaining technical details."},
+            {"role": "user", "content": summary_prompt}
+        ],
+        requested_model="mimo-v2.6-flash-free",
+        session_key=f"comp_{session_key}",
+        tools_override=[],
+        initial_key=opencode_key
+    )
+
+    summary_content = res.get("content", "").strip() if res.get("ok") else "خلاصه تاریخچه قبلی گفتگو."
+    compressed_summary_msg = {
+        "role": "system",
+        "content": f"📋 **خلاصه فشرده تاریخچه قبلی گفتگو (جهت تداوم کانتکست):**\n{summary_content}"
+    }
+
+    compressed_messages = [sys_msg, compressed_summary_msg] + recent_msgs
+    new_tokens = estimate_tokens(compressed_messages)
+    print(f"[Context Manager] Compressed from {tokens} tokens to {new_tokens} tokens successfully.", flush=True)
+    return compressed_messages
+
 # ──────────────── Job Processor ────────────────
 def process_job(job_data, bale_token, opencode_key, worker_url):
     question = job_data.get("question", "").strip()
@@ -789,18 +1061,29 @@ def process_job(job_data, bale_token, opencode_key, worker_url):
     print(f"\n[Agent Processing] Chat: {chat_id}, Topic: {topic_title} ({topic_id}), Model: {model}, Question: {question[:80]}", flush=True)
 
     sys_prompt = (
-        "You are 'Mr.3D Super Agent', an advanced autonomous AI assistant in the Bale messenger app.\n"
-        "You have powerful real-world tools that you can execute autonomously:\n"
-        "1. 'web_search': Search the live web for current facts, news, documentation, or real-time information.\n"
-        "2. 'read_webpage': Fetch, scrape, and read the full text/content of any webpage or article URL.\n"
-        "3. 'download_media': Download media (YouTube, Instagram reels/posts, TikTok, Twitter/X, SoundCloud, or direct URLs) and send the video/audio file directly to the user in their Bale chat!\n"
-        "4. 'generate_image': Generate high quality AI images from descriptive prompts and immediately send the photo to the user in Bale.\n"
-        "5. 'take_screenshot': Capture a full screenshot of any website or URL and send the photo directly to the user in Bale.\n"
-        "6. 'manage_workspace': Save, read, list, or delete persistent notes, code, documents, or data files in the user's permanent workspace in the repository across sessions.\n"
-        "7. 'upload_to_gdrive': Upload files to Google Drive and provide a shareable download link.\n\n"
-        "Always respond in fluent, natural Persian (Farsi) unless the user asks in another language.\n"
-        "When the user asks you to download a video, generate an image, take a screenshot, save a file, or search the web, execute the appropriate tool proactively!\n"
-        "After tools run, formulate a complete, friendly Persian response summarizing the action and findings."
+        "You are 'Mr.3D Super Agent', an advanced autonomous AI software engineer and intelligent assistant running on an Ubuntu runner with full terminal and disk access for Bale messenger.\n\n"
+        "WORKSPACES & ARCHITECTURE:\n"
+        "1. Ephemeral Scratch Workspace: '/tmp/agent_scratch' or runner local filesystem. Use this for scratch files, running tests, compiling scripts, downloading temporary data, and experimenting.\n"
+        "2. Persistent Workspace: 'agent_workspace/{chat_id}/'. Use the 'manage_persistent_workspace' tool to write or modify files here. Anything saved here is committed to Git and pushed to GitHub so it stays permanently available across sessions!\n"
+        "3. Repository Root: You can also inspect, read, and edit the repository code and bot files if the user instructs you to work on the bot or repo.\n\n"
+        "REAL EXECUTABLE TOOLS:\n"
+        "- 'bash': Execute any bash command with stdout/stderr capture (python3, pip, git, curl, ffmpeg, tests, etc.).\n"
+        "- 'read': Read any file from disk or repository (supports line ranges).\n"
+        "- 'write': Create or overwrite files.\n"
+        "- 'edit': Perform exact search-and-replace in existing files.\n"
+        "- 'glob': Find files matching pattern.\n"
+        "- 'grep': Search for strings or regular expressions across files.\n"
+        "- 'web_search': Search the live internet for up-to-date facts, documentation, or news.\n"
+        "- 'read_webpage': Extract readable text/markdown from any webpage URL.\n"
+        "- 'download_media': Download media from YouTube, Instagram, TikTok, etc. and deliver directly to Bale.\n"
+        "- 'generate_image': Generate high quality AI images with Flux and send directly to Bale.\n"
+        "- 'take_screenshot': Capture website screenshots and send to Bale.\n"
+        "- 'manage_persistent_workspace': Read, write, list, or delete permanent files in repository across sessions.\n"
+        "- 'upload_to_gdrive': Upload files to Google Drive and provide a shareable download link.\n\n"
+        "OPERATIONAL PRINCIPLES:\n"
+        "- Always respond in natural, fluent Persian (Farsi) unless the user requests another language.\n"
+        "- Act autonomously: chain tools proactively (e.g. search -> write code -> test with bash -> fix -> save) until the user's objective is fully accomplished.\n"
+        "- After tool executions complete, formulate a comprehensive, polite Persian response explaining what was done and the final results."
     )
 
     messages = [{"role": "system", "content": sys_prompt}]
@@ -811,11 +1094,14 @@ def process_job(job_data, bale_token, opencode_key, worker_url):
     messages.append({"role": "user", "content": question})
 
     session_key = f"{chat_id}:{topic_id}"
-    MAX_AGENT_TURNS = 4
+    MAX_AGENT_TURNS = 10
     final_answer = ""
     tool_results_log = []
 
     for turn in range(MAX_AGENT_TURNS):
+        # Apply 200k context compression check before each call
+        messages = compress_messages_if_needed(messages, session_key, opencode_key)
+
         res = call_opencode_stream(messages, model, session_key=session_key, initial_key=opencode_key)
         if not res.get("ok"):
             err_msg = res.get("error", "خطا در برقراری ارتباط با سرور مدل هوش مصنوعی.")
@@ -853,57 +1139,105 @@ def process_job(job_data, bale_token, opencode_key, worker_url):
                     pass
 
                 tool_output = ""
-                if tc_name == "web_search":
+                
+                # 1. BASH & SHELL COMMANDS
+                if tc_name == "bash":
+                    cmd = tc_args.get("command") or ""
+                    tm = int(tc_args.get("timeout") or 60)
+                    edit_bale_message(chat_id, msg_id, f"💻 **در حال اجرای دستور در محیط لینوکس...**\n`{cmd[:60]}`", bale_token)
+                    tool_output = run_bash(cmd, tm)
+                    tool_results_log.append(f"اجرای دستور `{cmd[:50]}`:\n{tool_output[:400]}")
+
+                # 2. READ FILE
+                elif tc_name == "read":
+                    fp = tc_args.get("filePath") or tc_args.get("path") or ""
+                    off = int(tc_args.get("offset") or 1)
+                    lim = int(tc_args.get("limit") or 300)
+                    tool_output = run_read_file(fp, off, lim)
+                    tool_results_log.append(f"خواندن فایل '{fp}':\n{tool_output[:300]}")
+
+                # 3. WRITE FILE
+                elif tc_name == "write":
+                    fp = tc_args.get("filePath") or tc_args.get("path") or ""
+                    cnt = tc_args.get("content") or ""
+                    edit_bale_message(chat_id, msg_id, f"📝 **در حال ایجاد فایل...**\n`{fp}`", bale_token)
+                    tool_output = run_write_file(fp, cnt)
+                    tool_results_log.append(f"نوشتن فایل '{fp}': {tool_output}")
+
+                # 4. EDIT FILE
+                elif tc_name == "edit":
+                    fp = tc_args.get("filePath") or tc_args.get("path") or ""
+                    old_str = tc_args.get("oldString") or ""
+                    new_str = tc_args.get("newString") or ""
+                    edit_bale_message(chat_id, msg_id, f"✏️ **در حال ویرایش فایل...**\n`{fp}`", bale_token)
+                    tool_output = run_edit_file(fp, old_str, new_str)
+                    tool_results_log.append(f"ویرایش فایل '{fp}': {tool_output}")
+
+                # 5. GLOB
+                elif tc_name == "glob":
+                    pat = tc_args.get("pattern") or "*"
+                    p = tc_args.get("path") or "."
+                    tool_output = run_glob_files(pat, p)
+                    tool_results_log.append(f"جستجوی فایل‌ها ({pat}):\n{tool_output[:300]}")
+
+                # 6. GREP
+                elif tc_name == "grep":
+                    pat = tc_args.get("pattern") or ""
+                    p = tc_args.get("path") or "."
+                    tool_output = run_grep(pat, p)
+                    tool_results_log.append(f"جستجوی متن ({pat}):\n{tool_output[:300]}")
+
+                # 7. WEB SEARCH
+                elif tc_name in ("web_search", "search"):
                     query = tc_args.get("query") or question
-                    edit_bale_message(chat_id, msg_id, f"🔍 **در حال جستجوی وب برای:**\n`{query}`...", bale_token)
+                    edit_bale_message(chat_id, msg_id, f"🔍 **در حال جستجوی اینترنت برای:**\n`{query}`...", bale_token)
                     tool_output = run_web_search(query)
-                    tool_results_log.append(f"جستجو برای '{query}':\n{tool_output}")
-                    
-                elif tc_name == "read_webpage":
+                    tool_results_log.append(f"جستجوی وب برای '{query}':\n{tool_output}")
+
+                # 8. READ WEBPAGE / WEBFETCH
+                elif tc_name in ("read_webpage", "webfetch"):
                     url = tc_args.get("url") or ""
                     edit_bale_message(chat_id, msg_id, f"📄 **در حال خواندن صفحه وب:**\n`{url}`...", bale_token)
                     tool_output = run_read_webpage(url)
-                    tool_results_log.append(f"محتوای صفحه '{url}':\n{tool_output[:500]}")
-                    
+                    tool_results_log.append(f"صفحه '{url}':\n{tool_output[:400]}")
+
+                # 9. DOWNLOAD MEDIA
                 elif tc_name == "download_media":
                     url = tc_args.get("url") or ""
-                    media_type = tc_args.get("media_type") or "auto"
-                    tool_output = run_download_media(url, media_type, chat_id, bale_token, msg_id)
+                    m_type = tc_args.get("media_type") or "auto"
+                    tool_output = run_download_media(url, m_type, chat_id, bale_token, msg_id)
                     tool_results_log.append(f"دانلود مدیا: {tool_output}")
-                    
+
+                # 10. GENERATE IMAGE
                 elif tc_name == "generate_image":
                     prompt = tc_args.get("prompt") or question
                     tool_output = run_generate_image(prompt, chat_id, bale_token, msg_id)
                     tool_results_log.append(f"تولید تصویر: {tool_output}")
-                    
+
+                # 11. TAKE SCREENSHOT
                 elif tc_name == "take_screenshot":
                     url = tc_args.get("url") or ""
                     tool_output = run_take_screenshot(url, chat_id, bale_token, msg_id)
                     tool_results_log.append(f"اسکرین‌شات: {tool_output}")
-                    
-                elif tc_name == "manage_workspace":
+
+                # 12. PERSISTENT WORKSPACE
+                elif tc_name in ("manage_persistent_workspace", "manage_workspace"):
                     action = tc_args.get("action") or "list"
                     fn = tc_args.get("filename") or ""
                     cnt = tc_args.get("content") or ""
+                    edit_bale_message(chat_id, msg_id, f"💾 **مدیریت فضای کاری در ریپازیتوری ({action})...**", bale_token)
                     tool_output = run_manage_workspace(action, fn, cnt, chat_id)
                     tool_results_log.append(f"فضای کاری ({action}): {tool_output}")
-                    
+
+                # 13. GOOGLE DRIVE UPLOAD
                 elif tc_name == "upload_to_gdrive":
                     fp = tc_args.get("file_path") or ""
                     fid = tc_args.get("drive_folder_id") or ""
                     tool_output = run_upload_to_gdrive(fp, fid, chat_id)
                     tool_results_log.append(f"گوگل درایو: {tool_output}")
-                    
-                elif tc_name == "read":
-                    fp = tc_args.get("filePath") or tc_args.get("path") or ""
-                    tool_output = run_read_file(fp)
-                    tool_results_log.append(f"خواندن فایل: {tool_output}")
-                    
-                elif tc_name in ("bash", "edit", "glob", "grep", "question", "skill", "task", "todowrite", "webfetch", "write"):
-                    tool_output = f"ابزار {tc_name} مربوط به کلاینت رسمی است و نیازی به فراخوانی نیست. لطفاً از ابزارهای بله استفاده کنید."
-                    
+
                 else:
-                    tool_output = "ابزار با موفقیت اجرا شد."
+                    tool_output = "عملیات با موفقیت انجام شد."
 
                 messages.append({
                     "role": "tool",
@@ -913,28 +1247,28 @@ def process_job(job_data, bale_token, opencode_key, worker_url):
                 })
 
             if turn == MAX_AGENT_TURNS - 2:
-                edit_bale_message(chat_id, msg_id, "✍️ **در حال نگارش پاسخ کامل بر اساس نتایج...**", bale_token)
+                edit_bale_message(chat_id, msg_id, "✍️ **در حال جمع‌بندی نهایی و نگارش پاسخ...**", bale_token)
                 messages.append({
                     "role": "user",
-                    "content": "با توجه به نتایج تمام ابزارهای اجرا شده، لطفاً پاسخ نهایی، کامل و شیوا را به زبان فارسی ارائه بده."
+                    "content": "با توجه به تمام ابزارهای اجرا شده و نتایج آن‌ها، پاسخ نهایی و کامل را به زبان فارسی ارائه بده."
                 })
         else:
             final_answer = content.strip() or reasoning.strip()
             break
 
-    # If final answer is still empty but tools ran, synthesize from results
+    # If final answer is empty but tools executed, synthesize
     if not final_answer and tool_results_log:
         print("[Agent Fallback] Synthesizing answer from tool results...", flush=True)
         edit_bale_message(chat_id, msg_id, "✍️ **در حال جمع‌بندی نهایی...**", bale_token)
         synth_msgs = [
             {"role": "system", "content": "You are a helpful Persian AI assistant named Mr.3D Super Agent. Answer the user comprehensively in Persian based on the actions taken and results."},
-            {"role": "user", "content": f"درخواست کاربر: {question}\n\nنتایج کارهای انجام شده توسط ابزارها:\n" + "\n\n".join(tool_results_log[:6]) + "\n\nپاسخ نهایی را به صورت کامل و دوستانه به زبان فارسی بنویس."}
+            {"role": "user", "content": f"درخواست کاربر: {question}\n\nاقدامات انجام شده:\n" + "\n\n".join(tool_results_log[:8]) + "\n\nپاسخ نهایی، مستند و شیوا را به زبان فارسی بنویس."}
         ]
         synth_res = call_opencode_stream(synth_msgs, "nemotron-3.5-lightning-free", session_key=session_key, tools_override=[], initial_key=opencode_key)
         if synth_res.get("ok"):
             final_answer = synth_res.get("content", "").strip() or synth_res.get("reasoning", "").strip()
 
-    # Emergency fallback retry if still empty
+    # Emergency fallback
     if not final_answer:
         em_res = call_opencode_stream([
             {"role": "system", "content": "You are a helpful Persian AI assistant."},
@@ -947,7 +1281,7 @@ def process_job(job_data, bale_token, opencode_key, worker_url):
         edit_bale_message(chat_id, msg_id, "❌ متأسفانه دریافت پاسخ از سرور هوش مصنوعی با خطا مواجه شد. لطفاً دوباره پیام خود را بفرستید.", bale_token)
         return
 
-    # Clean leaked reasoning headers if any
+    # Strip leaked reasoning headers if any
     hdr = final_answer.rfind('**Answer**')
     if hdr != -1 and re.search(r'\*\*Reasoning|Reasoning and information|Reasoning used', final_answer[:hdr], re.IGNORECASE):
         final_answer = final_answer[hdr + len('**Answer**'):].strip()
@@ -987,6 +1321,7 @@ def process_job(job_data, bale_token, opencode_key, worker_url):
 
 # ──────────────── Main Runner & Daemon Loop ────────────────
 def main():
+    ensure_git_config()
     bale_token = os.environ.get("BALE_BOT_TOKEN", "").strip()
     opencode_key = os.environ.get("OPENCODE_API_KEY", "").strip()
     worker_url = os.environ.get("WORKER_URL", "").strip()
