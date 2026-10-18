@@ -179,10 +179,20 @@ def run_bash(command: str, timeout: int = 60) -> str:
     """Executes arbitrary bash commands or scripts on the Linux runner."""
     print(f"[Agent Tool: bash] {command[:100]}", flush=True)
     scratch_dir = "/tmp/agent_scratch"
-    os.makedirs(scratch_dir, exist_ok=True)
     try:
+        os.makedirs(scratch_dir, exist_ok=True)
+    except Exception:
+        scratch_dir = os.path.join(os.getcwd(), "agent_scratch")
+        os.makedirs(scratch_dir, exist_ok=True)
+    try:
+        import shutil
+        if sys.platform == "win32" and not shutil.which("bash"):
+            shell_cmd = ["powershell", "-NoProfile", "-Command", command]
+        else:
+            shell_cmd = ["bash", "-c", command]
+
         proc = subprocess.run(
-            ["bash", "-c", command],
+            shell_cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
