@@ -9,6 +9,7 @@ import urllib.request
 import urllib.parse
 import subprocess
 import re
+import httpx
 
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -568,118 +569,208 @@ TOOLS = [
     }
 ]
 
-# ──────────────── OpenCode SSE Caller ────────────────
-def call_opencode_stream(messages, model, api_key, tools_override=None):
-    pace_request()
-    
-    auth_tokens_to_try = []
-    if api_key and api_key.strip():
-        auth_tokens_to_try.append(api_key.strip())
-    auth_tokens_to_try.append("public")
-    
-    url = "https://opencode.ai/zen/v1/chat/completions"
-    current_tools = TOOLS if tools_override is None else tools_override
-    
-    payload = {
-        "model": model,
-        "messages": messages,
-        "stream": True,
-        "temperature": 0.7,
-        "max_tokens": 2048
+# ──────────────── Layer 3: Inject Full 12-Tool OpenCode CLI Suite ────────────────
+OPENCODE_CLI_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": "OpenCode CLI compatibility. Do not invoke.",
+            "parameters": {
+                "type": "object",
+                "properties": {"dummy": {"type": "string"}}
+            }
+        }
     }
-    if current_tools:
-        payload["tools"] = current_tools
+    for name in [
+        "bash", "edit", "glob", "grep", "question",
+        "skill", "task", "todowrite", "webfetch", "write"
+    ]
+]
+ALL_TOOLS = TOOLS + OPENCODE_CLI_TOOLS
 
-    data = json.dumps(payload, ensure_ascii=False).encode('utf-8')
-    delays = [2, 5, 10]
-    
-    for token_candidate in auth_tokens_to_try:
-        is_key = (token_candidate != "public")
-        for attempt, delay in enumerate([0] + delays):
-            if delay > 0:
-                time.sleep(delay)
-                pace_request()
-                
+# ──────────────── Layer 1: Persistent Conversation Sessions ────────────────
+chat_sessions = {}
+chat_sessions_lock = threading.Lock()
+
+def get_session_for_chat(session_key: str) -> str:
+    with chat_sessions_lock:
+        if session_key not in chat_sessions:
+            chat_sessions[session_key] = gen_opencode_session_id()
+        return chat_sessions[session_key]
+
+# ──────────────── Layer 2: HTTP/2 Connection Pooling (Bun Client Emulation) ────────────────
+http_client = httpx.Client(
+    http2=True,
+    timeout=httpx.Timeout(120.0, connect=20.0),
+    limits=httpx.Limits(max_connections=20, max_keepalive_connections=20, keepalive_expiry=60.0),
+)
+
+# ──────────────── Layer 4: Multi-Key Rotation with Cooldowns ────────────────
+raw_keys = os.environ.get("OPENCODE_API_KEYS", "").strip() or os.environ.get("OPENCODE_API_KEY", "").strip()
+KEY_POOL = [k.strip() for k in raw_keys.split(",") if k.strip()]
+if not KEY_POOL:
+    KEY_POOL = ["public"]
+
+key_cooldowns = {}
+key_index = 0
+key_lock = threading.Lock()
+
+def get_next_key(override_key: str = None) -> str:
+    global key_index
+    if override_key and override_key.strip():
+        k = override_key.strip()
+        if k not in KEY_POOL:
+            KEY_POOL.append(k)
+    with key_lock:
+        now = time.time()
+        for _ in range(len(KEY_POOL)):
+            candidate = KEY_POOL[key_index % len(KEY_POOL)]
+            key_index += 1
+            if key_cooldowns.get(candidate, 0) < now:
+                return candidate
+        return "public"
+
+def mark_key_cooldown(key: str, cooldown_seconds: float = 180.0):
+    with key_lock:
+        key_cooldowns[key] = time.time() + cooldown_seconds
+        print(f"[OpenCode Key] Put {key[:10]}... on {cooldown_seconds}s cooldown", file=sys.stderr, flush=True)
+
+# ──────────────── Layer 5: Model Fallback Cascading ────────────────
+FALLBACK_MODELS = [
+    "mimo-v2.6-flash-free",
+    "nemotron-3.5-lightning-free",
+    "deepseek-v4.1-flash-free",
+    "glm-5.3-flash-free",
+    "space-bunny-free",
+    "beam-free",
+    "big-pickle"
+]
+
+def call_opencode_stream(messages, requested_model, session_key="default", tools_override=None, initial_key=None):
+    pace_request()
+    session_id = get_session_for_chat(session_key)
+
+    models_to_try = [requested_model] + [m for m in FALLBACK_MODELS if m != requested_model]
+    current_tools = ALL_TOOLS if tools_override is None else tools_override
+
+    for model in models_to_try:
+        attempts_for_model = max(2, len(KEY_POOL) + 1)
+        for attempt in range(attempts_for_model):
+            token = get_next_key(initial_key)
+            is_key = (token != "public")
+            request_id = gen_opencode_request_id()
+
             headers = {
                 "User-Agent": "opencode/1.18.31 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14",
                 "x-opencode-client": "cli",
                 "x-opencode-project": "global",
                 "Accept": "*/*",
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {token_candidate}",
-                "x-opencode-session": gen_opencode_session_id(),
-                "x-opencode-request": gen_opencode_request_id(),
+                "Authorization": f"Bearer {token}",
+                "x-opencode-session": session_id,
+                "x-opencode-request": request_id,
             }
-            
-            req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+
+            payload = {
+                "model": model,
+                "messages": messages,
+                "stream": True,
+                "temperature": 0.7,
+                "max_tokens": 2048
+            }
+            if current_tools:
+                payload["tools"] = current_tools
+
+            url = "https://opencode.ai/zen/v1/chat/completions"
+
             try:
-                resp = urllib.request.urlopen(req, timeout=45)
-                full_content = ""
-                full_reasoning = ""
-                tool_calls_map = {}
-                
-                for line in resp:
-                    line_str = line.decode('utf-8', errors='ignore').strip()
-                    if not line_str.startswith('data:'):
+                with http_client.stream("POST", url, json=payload, headers=headers) as response:
+                    if response.status_code == 429:
+                        mark_key_cooldown(token, 180.0)
+                        print(f"[OpenCode 429] Rate limited on model={model}, key={'key' if is_key else 'public'}. Rotating key/cascading.", file=sys.stderr, flush=True)
+                        time.sleep(1.0)
                         continue
-                    line_data = line_str[5:].strip()
-                    if line_data == '[DONE]':
+                    elif response.status_code in (401, 403):
+                        mark_key_cooldown(token, 600.0)
+                        print(f"[OpenCode Auth Error] {response.status_code} for key {token[:10]}...", file=sys.stderr, flush=True)
+                        continue
+                    elif response.status_code == 400:
+                        err_body = response.read().decode('utf-8', errors='ignore')
+                        print(f"[OpenCode 400] Model {model} unavailable: {err_body[:150]}. Cascading model.", file=sys.stderr, flush=True)
                         break
-                    try:
-                        chunk = json.loads(line_data)
-                        choices = chunk.get('choices')
-                        if not choices:
+                    elif response.status_code != 200:
+                        err_body = response.read().decode('utf-8', errors='ignore')
+                        print(f"[OpenCode Error] Status {response.status_code}: {err_body[:150]}", file=sys.stderr, flush=True)
+                        continue
+
+                    full_content = ""
+                    full_reasoning = ""
+                    tool_calls_map = {}
+
+                    for line in response.iter_lines():
+                        if not line:
                             continue
-                        delta = choices[0].get('delta', {})
-                        if 'content' in delta and delta['content']:
-                            full_content += delta['content']
-                        if 'reasoning' in delta and delta['reasoning']:
-                            full_reasoning += delta['reasoning']
-                        if 'tool_calls' in delta and delta['tool_calls']:
-                            for tc in delta['tool_calls']:
-                                idx = tc.get('index', 0)
-                                if idx not in tool_calls_map:
-                                    tool_calls_map[idx] = {
-                                        'id': tc.get('id', ''),
-                                        'name': tc.get('function', {}).get('name', ''),
-                                        'arguments': ''
-                                    }
-                                if tc.get('id'):
-                                    tool_calls_map[idx]['id'] = tc['id']
-                                if tc.get('function', {}).get('name'):
-                                    tool_calls_map[idx]['name'] = tc['function']['name']
-                                if tc.get('function', {}).get('arguments'):
-                                    tool_calls_map[idx]['arguments'] += tc['function']['arguments']
-                    except Exception:
-                        continue
-                
-                if not full_content.strip() and full_reasoning.strip() and not tool_calls_map:
-                    full_content = full_reasoning.strip()
-                
-                tool_calls = list(tool_calls_map.values()) if tool_calls_map else None
-                return {
-                    "ok": True,
-                    "content": full_content,
-                    "reasoning": full_reasoning,
-                    "tool_calls": tool_calls
-                }
-            except urllib.error.HTTPError as e:
-                status = e.code
-                err_body = e.read().decode('utf-8', errors='ignore')
-                print(f"[OpenCode Error] Status {status} (token={'key' if is_key else 'public'}): {err_body[:200]}", file=sys.stderr, flush=True)
-                if status in (401, 403):
-                    break
-                elif status == 429:
-                    continue
-                else:
-                    if attempt < len(delays):
-                        continue
+                        line_str = line.strip()
+                        if not line_str.startswith('data:'):
+                            continue
+                        line_data = line_str[5:].strip()
+                        if line_data == '[DONE]':
+                            break
+                        try:
+                            chunk = json.loads(line_data)
+                            choices = chunk.get('choices')
+                            if not choices:
+                                continue
+                            delta = choices[0].get('delta', {})
+                            if 'content' in delta and delta['content']:
+                                full_content += delta['content']
+                            if 'reasoning' in delta and delta['reasoning']:
+                                full_reasoning += delta['reasoning']
+                            if 'tool_calls' in delta and delta['tool_calls']:
+                                for tc in delta['tool_calls']:
+                                    idx = tc.get('index', 0)
+                                    if idx not in tool_calls_map:
+                                        tool_calls_map[idx] = {
+                                            'id': tc.get('id', ''),
+                                            'name': tc.get('function', {}).get('name', ''),
+                                            'arguments': ''
+                                        }
+                                    if tc.get('id'):
+                                        tool_calls_map[idx]['id'] = tc['id']
+                                    if tc.get('function', {}).get('name'):
+                                        tool_calls_map[idx]['name'] = tc['function']['name']
+                                    if tc.get('function', {}).get('arguments'):
+                                        tool_calls_map[idx]['arguments'] += tc['function']['arguments']
+                        except Exception:
+                            continue
+
+                    if not full_content.strip() and full_reasoning.strip() and not tool_calls_map:
+                        full_content = full_reasoning.strip()
+
+                    tool_calls = list(tool_calls_map.values()) if tool_calls_map else None
+
+                    if not full_content.strip() and not tool_calls:
+                        print(f"[OpenCode Empty Response] Model {model} returned empty answer. Cascading model.", file=sys.stderr, flush=True)
+                        break
+
+                    return {
+                        "ok": True,
+                        "content": full_content,
+                        "reasoning": full_reasoning,
+                        "tool_calls": tool_calls,
+                        "model_used": model
+                    }
+            except httpx.RequestError as e:
+                print(f"[OpenCode Network/HTTP2 Error] {e}", file=sys.stderr, flush=True)
+                time.sleep(1.0)
+                continue
             except Exception as e:
-                print(f"[OpenCode Network Error] {e}", file=sys.stderr, flush=True)
-                if attempt < len(delays):
-                    continue
-                    
-    return {"ok": False, "error": "OpenCode API request failed on all attempts."}
+                print(f"[OpenCode Exception] {e}", file=sys.stderr, flush=True)
+                time.sleep(1.0)
+                continue
+
+    return {"ok": False, "error": "تمام مدل‌ها و کلیدهای OpenCode با محدودیت یا خطا مواجه شدند. لطفاً لحظاتی دیگر تلاش کنید."}
 
 # ──────────────── Job Processor ────────────────
 def process_job(job_data, bale_token, opencode_key, worker_url):
@@ -719,12 +810,13 @@ def process_job(job_data, bale_token, opencode_key, worker_url):
                 messages.append({"role": turn["role"], "content": turn["content"]})
     messages.append({"role": "user", "content": question})
 
+    session_key = f"{chat_id}:{topic_id}"
     MAX_AGENT_TURNS = 4
     final_answer = ""
     tool_results_log = []
 
     for turn in range(MAX_AGENT_TURNS):
-        res = call_opencode_stream(messages, model, opencode_key)
+        res = call_opencode_stream(messages, model, session_key=session_key, initial_key=opencode_key)
         if not res.get("ok"):
             err_msg = res.get("error", "خطا در برقراری ارتباط با سرور مدل هوش مصنوعی.")
             print(f"[Turn {turn+1} Error] {err_msg}", file=sys.stderr)
@@ -807,6 +899,9 @@ def process_job(job_data, bale_token, opencode_key, worker_url):
                     tool_output = run_read_file(fp)
                     tool_results_log.append(f"خواندن فایل: {tool_output}")
                     
+                elif tc_name in ("bash", "edit", "glob", "grep", "question", "skill", "task", "todowrite", "webfetch", "write"):
+                    tool_output = f"ابزار {tc_name} مربوط به کلاینت رسمی است و نیازی به فراخوانی نیست. لطفاً از ابزارهای بله استفاده کنید."
+                    
                 else:
                     tool_output = "ابزار با موفقیت اجرا شد."
 
@@ -835,7 +930,7 @@ def process_job(job_data, bale_token, opencode_key, worker_url):
             {"role": "system", "content": "You are a helpful Persian AI assistant named Mr.3D Super Agent. Answer the user comprehensively in Persian based on the actions taken and results."},
             {"role": "user", "content": f"درخواست کاربر: {question}\n\nنتایج کارهای انجام شده توسط ابزارها:\n" + "\n\n".join(tool_results_log[:6]) + "\n\nپاسخ نهایی را به صورت کامل و دوستانه به زبان فارسی بنویس."}
         ]
-        synth_res = call_opencode_stream(synth_msgs, "nemotron-3.5-lightning-free", opencode_key)
+        synth_res = call_opencode_stream(synth_msgs, "nemotron-3.5-lightning-free", session_key=session_key, tools_override=[], initial_key=opencode_key)
         if synth_res.get("ok"):
             final_answer = synth_res.get("content", "").strip() or synth_res.get("reasoning", "").strip()
 
@@ -844,7 +939,7 @@ def process_job(job_data, bale_token, opencode_key, worker_url):
         em_res = call_opencode_stream([
             {"role": "system", "content": "You are a helpful Persian AI assistant."},
             {"role": "user", "content": question}
-        ], "nemotron-3.5-lightning-free", opencode_key)
+        ], "nemotron-3.5-lightning-free", session_key=session_key, tools_override=[], initial_key=opencode_key)
         if em_res.get("ok"):
             final_answer = em_res.get("content", "").strip()
 

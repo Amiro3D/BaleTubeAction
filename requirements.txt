@@ -5,3 +5,5 @@ yt-dlp>=2024.04.09
 beautifulsoup4>=4.12.0
 google-api-python-client>=2.100.0
 google-auth>=2.20.0
+httpx>=0.27.0
+h2>=4.1.0

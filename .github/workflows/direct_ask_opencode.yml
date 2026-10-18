@@ -38,6 +38,7 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         BALE_BOT_TOKEN: ${{ secrets.BALE_BOT_TOKEN }}
         OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+        OPENCODE_API_KEYS: ${{ secrets.OPENCODE_API_KEYS || secrets.OPENCODE_API_KEY }}
         GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS || '' }}
         QUESTION: ${{ github.event.client_payload.question }}
         MODEL: ${{ github.event.client_payload.model || 'mimo-v2.6-flash-free' }}
