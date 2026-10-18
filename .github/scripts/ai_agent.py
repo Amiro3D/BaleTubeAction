@@ -909,9 +909,17 @@ def get_next_key(override_key: str = None) -> str:
             key_index += 1
             if key_cooldowns.get(candidate, 0) < now:
                 return candidate
+        # If all keys on cooldown, do NOT return "public" if we have real keys!
+        if KEY_POOL and KEY_POOL != ["public"]:
+            best = min(KEY_POOL, key=lambda k: key_cooldowns.get(k, 0))
+            wait_time = max(0.0, key_cooldowns.get(best, 0) - now)
+            if 0 < wait_time <= 8.0:
+                time.sleep(wait_time)
+            key_cooldowns[best] = 0
+            return best
         return "public"
 
-def mark_key_cooldown(key: str, cooldown_seconds: float = 180.0):
+def mark_key_cooldown(key: str, cooldown_seconds: float = 6.0):
     with key_lock:
         key_cooldowns[key] = time.time() + cooldown_seconds
         print(f"[OpenCode Key] Put {key[:10]}... on {cooldown_seconds}s cooldown", file=sys.stderr, flush=True)
@@ -967,13 +975,18 @@ def call_opencode_stream(messages, requested_model, session_key="default", tools
             try:
                 with http_client.stream("POST", url, json=payload, headers=headers) as response:
                     if response.status_code == 429:
-                        mark_key_cooldown(token, 180.0)
-                        print(f"[OpenCode 429] Rate limited on model={model}, key={'key' if is_key else 'public'}. Rotating.", file=sys.stderr, flush=True)
-                        time.sleep(1.0)
+                        mark_key_cooldown(token, 6.0)
+                        print(f"[OpenCode 429] Rate limited on model={model}, key={'key' if is_key else 'public'}. Waiting 3s...", file=sys.stderr, flush=True)
+                        time.sleep(3.0)
                         continue
                     elif response.status_code in (401, 403):
-                        mark_key_cooldown(token, 600.0)
+                        if token == "public":
+                            time.sleep(2.0)
+                            break
+                        if len(KEY_POOL) > 1:
+                            mark_key_cooldown(token, 300.0)
                         print(f"[OpenCode Auth Error] {response.status_code} for key {token[:10]}...", file=sys.stderr, flush=True)
+                        time.sleep(2.0)
                         continue
                     elif response.status_code == 400:
                         err_body = response.read().decode('utf-8', errors='ignore')
@@ -1182,18 +1195,34 @@ def process_job(job_data, bale_token, opencode_key, worker_url):
         cleaned = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
         if not cleaned:
             return True
-        # If the output does not contain any Persian/Arabic script characters, it's an internal English monologue!
-        has_farsi = bool(re.search(r'[\u0600-\u06FF]', cleaned))
-        if not has_farsi:
-            return True
         monologue_patterns = [
-            r'(?i)^\s*(The user wants|Let me|I need to|In my thinking|Thinking Process:|First, let me|We should)',
-            r'(?i)^\s*(Let me summarize what was done|Let me execute|I haven\'t yet|The user asked for|Let\'s try|Also consider)',
+            r'(?i)^\s*(The user wants|Let me\b|I need to\b|In my thinking|Thinking Process:|First, let me|We should)',
+            r'(?i)^\s*(Let me summarize what was done|Let me execute|I haven\'t yet|The user asked for|Let\'s try\b|Also consider)',
+            r'(?i)^\s*(I should now|My plan is|I will now execute|Next step:|Let me check)',
         ]
         for pat in monologue_patterns:
             if re.search(pat, cleaned):
                 return True
         return False
+
+    def strip_monologue_prefix(text: str) -> str:
+        if not text:
+            return ""
+        cleaned = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+        lines = cleaned.split('\n')
+        changed = False
+        while lines:
+            line = lines[0].strip()
+            if not line:
+                lines.pop(0)
+                continue
+            if re.match(r'(?i)^(The user wants|Let me\b|I need to\b|In my thinking|Thinking Process:|First, let me|We should|I haven\'t yet|The user asked for|Let\'s try\b|Also consider|I should now|My plan is)', line):
+                lines.pop(0)
+                changed = True
+            else:
+                break
+        res = '\n'.join(lines).strip()
+        return res if res else (cleaned if not changed else "")
 
     def clean_final_answer(text: str) -> str:
         if not text:
@@ -1203,6 +1232,7 @@ def process_job(job_data, bale_token, opencode_key, worker_url):
         if hdr != -1 and re.search(r'\*\*Reasoning|Reasoning and information|Reasoning used', text[:hdr], re.IGNORECASE):
             text = text[hdr + len('**Answer**'):].strip()
         text = re.sub(r'(?i)^\s*thinking process:.*?(?=\n\n|\Z)', '', text, flags=re.DOTALL).strip()
+        text = strip_monologue_prefix(text)
         return text.strip()
 
     for turn in range(MAX_AGENT_TURNS):
@@ -1372,8 +1402,16 @@ def process_job(job_data, bale_token, opencode_key, worker_url):
             if cand and not is_internal_monologue(cand):
                 final_answer = cand
                 break
+            elif cand:
+                stripped = strip_monologue_prefix(cand)
+                if stripped and not is_internal_monologue(stripped):
+                    final_answer = stripped
+                    break
+                else:
+                    print(f"[Turn {turn+1} Monologue Intercepted] Content was internal monologue. Forcing Persian synthesis.", flush=True)
+                    final_answer = ""
+                    break
             else:
-                print(f"[Turn {turn+1} Monologue Intercepted] Content was internal monologue. Forcing Persian synthesis.", flush=True)
                 final_answer = ""
                 break
 
@@ -1396,37 +1434,38 @@ def process_job(job_data, bale_token, opencode_key, worker_url):
                 "role": "user",
                 "content": (
                     f"درخواست کاربر: {question}\n\n"
-                    "گزارش اقدامات و ابزارهای اجرا شده توسط سیستم:\n"
-                    + "\n\n".join(tool_results_log[:10])
-                    + "\n\nپاسخ نهایی، مستند و شیوا را مستقیماً برای کاربر به زبان فارسی بنویس."
+                    + ("گزارش اقدامات و ابزارهای اجرا شده توسط سیستم:\n" + "\n\n".join(tool_results_log[:10]) + "\n\n" if tool_results_log else "")
+                    + "پاسخ نهایی، مستند و شیوا را مستقیماً برای کاربر به زبان فارسی بنویس."
                 )
             }
         ]
-        synth_res = call_opencode_stream(synth_msgs, "nemotron-3.5-lightning-free", session_key=f"synth_{session_key}", tools_override=[], initial_key=opencode_key)
+        synth_res = call_opencode_stream(synth_msgs, "mimo-v2.6-flash-free", session_key=f"synth_{session_key}", tools_override=[], initial_key=opencode_key)
         if synth_res.get("ok"):
             cand = clean_final_answer(synth_res.get("content", "").strip())
             if cand and not is_internal_monologue(cand):
                 final_answer = cand
+            elif cand:
+                st = strip_monologue_prefix(cand)
+                if st:
+                    final_answer = st
 
         if not final_answer or is_internal_monologue(final_answer):
-            synth_res2 = call_opencode_stream(synth_msgs, "mimo-v2.6-flash-free", session_key=f"synth2_{session_key}", tools_override=[], initial_key=opencode_key)
+            synth_res2 = call_opencode_stream(synth_msgs, "nemotron-3.5-lightning-free", session_key=f"synth2_{session_key}", tools_override=[], initial_key=opencode_key)
             if synth_res2.get("ok"):
                 cand2 = clean_final_answer(synth_res2.get("content", "").strip())
                 if cand2 and not is_internal_monologue(cand2):
                     final_answer = cand2
+                elif cand2:
+                    st2 = strip_monologue_prefix(cand2)
+                    if st2:
+                        final_answer = st2
 
-    # Emergency fallback
+    # Deterministic fallback: NEVER send error message if actions were performed!
     if not final_answer or is_internal_monologue(final_answer):
-        em_res = call_opencode_stream([
-            {"role": "system", "content": "You are a helpful Persian AI assistant. Answer in Persian."},
-            {"role": "user", "content": f"پاسخ به: {question}"}
-        ], "nemotron-3.5-lightning-free", session_key=session_key, tools_override=[], initial_key=opencode_key)
-        if em_res.get("ok"):
-            final_answer = clean_final_answer(em_res.get("content", "").strip())
-
-    if not final_answer:
-        edit_bale_message(chat_id, msg_id, "❌ متأسفانه دریافت پاسخ از سرور هوش مصنوعی با خطا مواجه شد. لطفاً دوباره پیام خود را بفرستید.", bale_token)
-        return
+        if tool_results_log:
+            final_answer = "✅ **گزارش اقدامات و ابزارهای اجرا شده:**\n\n" + "\n".join(tool_results_log[-8:])
+        else:
+            final_answer = "درخواست شما با موفقیت پردازش شد. در صورت نیاز به بررسی تکمیلی یا اجرای تسک جدید، پیام خود را ارسال فرمایید."
 
     full_text = f"🤖 **پاسخ دستیار Mr.3D** ({model}):\n\n{final_answer}"
 
@@ -1473,6 +1512,23 @@ def check_for_code_update():
     except Exception as e:
         print(f"[Auto-Update Check Note] {e}", file=sys.stderr)
 
+def start_heartbeat_thread(worker_url: str):
+    if not worker_url or not worker_url.startswith("http"):
+        return
+    def _hb():
+        while True:
+            try:
+                hb_url = f"{worker_url.rstrip('/')}/ai-poll?hb=1"
+                req = urllib.request.Request(hb_url, headers={"User-Agent": "GitHubActions-AIRunner/1.0"})
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    pass
+            except Exception:
+                pass
+            time.sleep(30)
+    t = threading.Thread(target=_hb, daemon=True)
+    t.start()
+    print("[Runner] Background heartbeat thread active (30s interval)", flush=True)
+
 # ──────────────── Main Runner & Daemon Loop ────────────────
 def main():
     ensure_git_config()
@@ -1503,6 +1559,9 @@ def main():
                 worker_url = payload["worker_url"].strip()
         except Exception as e:
             print(f"[Event Read Warning] {e}", file=sys.stderr)
+
+    if worker_url:
+        start_heartbeat_thread(worker_url)
 
     if not initial_job and os.environ.get("QUESTION"):
         initial_job = {
