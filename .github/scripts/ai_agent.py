@@ -1172,9 +1172,38 @@ def process_job(job_data, bale_token, opencode_key, worker_url):
     messages.append({"role": "user", "content": question})
 
     session_key = f"{chat_id}:{topic_id}"
-    MAX_AGENT_TURNS = 10
+    MAX_AGENT_TURNS = 16
     final_answer = ""
     tool_results_log = []
+
+    def is_internal_monologue(text: str) -> bool:
+        if not text or not text.strip():
+            return True
+        cleaned = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+        if not cleaned:
+            return True
+        # If the output does not contain any Persian/Arabic script characters, it's an internal English monologue!
+        has_farsi = bool(re.search(r'[\u0600-\u06FF]', cleaned))
+        if not has_farsi:
+            return True
+        monologue_patterns = [
+            r'(?i)^\s*(The user wants|Let me|I need to|In my thinking|Thinking Process:|First, let me|We should)',
+            r'(?i)^\s*(Let me summarize what was done|Let me execute|I haven\'t yet|The user asked for|Let\'s try|Also consider)',
+        ]
+        for pat in monologue_patterns:
+            if re.search(pat, cleaned):
+                return True
+        return False
+
+    def clean_final_answer(text: str) -> str:
+        if not text:
+            return ""
+        text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+        hdr = text.rfind('**Answer**')
+        if hdr != -1 and re.search(r'\*\*Reasoning|Reasoning and information|Reasoning used', text[:hdr], re.IGNORECASE):
+            text = text[hdr + len('**Answer**'):].strip()
+        text = re.sub(r'(?i)^\s*thinking process:.*?(?=\n\n|\Z)', '', text, flags=re.DOTALL).strip()
+        return text.strip()
 
     for turn in range(MAX_AGENT_TURNS):
         # Apply 200k context compression check before each call
@@ -1190,7 +1219,7 @@ def process_job(job_data, bale_token, opencode_key, worker_url):
         content = res.get("content", "").strip()
         reasoning = res.get("reasoning", "").strip()
 
-        if tool_calls and turn < MAX_AGENT_TURNS - 1:
+        if tool_calls:
             print(f"[Turn {turn+1}] Model requested {len(tool_calls)} tool call(s)", flush=True)
             asst_msg = {
                 "role": "assistant",
@@ -1332,50 +1361,46 @@ def process_job(job_data, bale_token, opencode_key, worker_url):
                     "content": tool_output
                 })
 
-            if turn == MAX_AGENT_TURNS - 2:
-                edit_bale_message(chat_id, msg_id, "✍️ **در حال جمع‌بندی نهایی و نگارش پاسخ...**", bale_token)
+            if turn >= MAX_AGENT_TURNS - 3:
+                edit_bale_message(chat_id, msg_id, "✍️ **در حال جمع‌بندی نهایی به زبان فارسی...**", bale_token)
                 messages.append({
                     "role": "user",
-                    "content": "با توجه به تمام ابزارهای اجرا شده و نتایج آن‌ها، پاسخ نهایی و کامل را به زبان فارسی ارائه بده. از آوردن افکار درونی انگلیسی خودداری کن."
+                    "content": "اکنون تمام اقدامات و فایل‌ها را تکمیل کن و پاسخ نهایی، کامل و شیوا را مستقیماً به زبان فارسی برای کاربر بنویس. از آوردن افکار درونی انگلیسی خودداری کن."
                 })
         else:
-            final_answer = content.strip() or reasoning.strip()
-            break
+            cand = clean_final_answer(content.strip() or reasoning.strip())
+            if cand and not is_internal_monologue(cand):
+                final_answer = cand
+                break
+            else:
+                print(f"[Turn {turn+1} Monologue Intercepted] Content was internal monologue. Forcing Persian synthesis.", flush=True)
+                final_answer = ""
+                break
 
-    def is_internal_monologue(text: str) -> bool:
-        if not text:
-            return True
-        cleaned = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
-        if not cleaned:
-            return True
-        monologue_patterns = [
-            r'(?i)^\s*(The user wants|Let me|I need to|In my thinking|Thinking Process:|First, let me|We should)',
-            r'(?i)^\s*(Let me summarize what was done|Let me execute|I haven\'t yet|The user asked for)',
-        ]
-        for pat in monologue_patterns:
-            if re.search(pat, cleaned):
-                return True
-        return False
-
-    def clean_final_answer(text: str) -> str:
-        if not text:
-            return ""
-        text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
-        hdr = text.rfind('**Answer**')
-        if hdr != -1 and re.search(r'\*\*Reasoning|Reasoning and information|Reasoning used', text[:hdr], re.IGNORECASE):
-            text = text[hdr + len('**Answer**'):].strip()
-        text = re.sub(r'(?i)^\s*thinking process:.*?(?=\n\n|\Z)', '', text, flags=re.DOTALL).strip()
-        return text.strip()
-
-    final_answer = clean_final_answer(final_answer)
-
-    # If final answer is empty OR is clearly an internal monologue/reasoning, synthesize!
-    if is_internal_monologue(final_answer) or (not final_answer and tool_results_log):
+    # If final answer is empty OR is clearly an internal monologue, synthesize in Persian!
+    if not final_answer or is_internal_monologue(final_answer):
         print("[Agent Synthesis] Synthesizing clean Persian final answer...", flush=True)
-        edit_bale_message(chat_id, msg_id, "✍️ **در حال جمع‌بندی نهایی...**", bale_token)
+        edit_bale_message(chat_id, msg_id, "✍️ **در حال نگارش پاسخ نهایی به زبان فارسی...**", bale_token)
         synth_msgs = [
-            {"role": "system", "content": "You are Mr.3D Super Agent, a polite and capable Persian assistant. Your task is to provide the final polite user-facing answer in Persian. NEVER output internal thoughts, planning, or English monologues. Explain clearly what actions were taken and what the result is."},
-            {"role": "user", "content": f"درخواست کاربر: {question}\n\nگزارش اقدامات و ابزارهای اجرا شده:\n" + "\n\n".join(tool_results_log[:8]) + "\n\nپاسخ نهایی، مستند و شیوا را مستقیماً به کاربر به زبان فارسی تحویل بده."}
+            {
+                "role": "system",
+                "content": (
+                    "You are 'Mr.3D Super Agent', an advanced autonomous software engineer and AI assistant for Bale messenger.\n"
+                    "CRITICAL REQUIREMENTS:\n"
+                    "- Respond EXCLUSIVELY in fluent, polite Persian (Farsi).\n"
+                    "- NEVER output internal English planning or monologue (e.g. 'The user wants...', 'Let me...').\n"
+                    "- Clearly explain what actions were executed, what files were generated or sent, and provide the comprehensive answer directly to the user."
+                )
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"درخواست کاربر: {question}\n\n"
+                    "گزارش اقدامات و ابزارهای اجرا شده توسط سیستم:\n"
+                    + "\n\n".join(tool_results_log[:10])
+                    + "\n\nپاسخ نهایی، مستند و شیوا را مستقیماً برای کاربر به زبان فارسی بنویس."
+                )
+            }
         ]
         synth_res = call_opencode_stream(synth_msgs, "nemotron-3.5-lightning-free", session_key=f"synth_{session_key}", tools_override=[], initial_key=opencode_key)
         if synth_res.get("ok"):
@@ -1383,11 +1408,18 @@ def process_job(job_data, bale_token, opencode_key, worker_url):
             if cand and not is_internal_monologue(cand):
                 final_answer = cand
 
+        if not final_answer or is_internal_monologue(final_answer):
+            synth_res2 = call_opencode_stream(synth_msgs, "mimo-v2.6-flash-free", session_key=f"synth2_{session_key}", tools_override=[], initial_key=opencode_key)
+            if synth_res2.get("ok"):
+                cand2 = clean_final_answer(synth_res2.get("content", "").strip())
+                if cand2 and not is_internal_monologue(cand2):
+                    final_answer = cand2
+
     # Emergency fallback
-    if not final_answer:
+    if not final_answer or is_internal_monologue(final_answer):
         em_res = call_opencode_stream([
-            {"role": "system", "content": "You are a helpful Persian AI assistant."},
-            {"role": "user", "content": question}
+            {"role": "system", "content": "You are a helpful Persian AI assistant. Answer in Persian."},
+            {"role": "user", "content": f"پاسخ به: {question}"}
         ], "nemotron-3.5-lightning-free", session_key=session_key, tools_override=[], initial_key=opencode_key)
         if em_res.get("ok"):
             final_answer = clean_final_answer(em_res.get("content", "").strip())
